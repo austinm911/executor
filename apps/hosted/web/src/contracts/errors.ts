@@ -1,8 +1,10 @@
 import { registryErrorMessage } from "@executor-js/ui/contracts/registry-error";
+import { mayHaveWrittenFailure } from "@executor-js/sdk";
 import type { HostedApi } from "@executor-js/hosted-server/contracts";
 import { Cause, Match, Option, type Schema } from "effect";
 import type { HttpApiEndpoint, HttpApiGroup } from "effect/http-api";
 import type { HttpClientError } from "effect/http";
+import { outdatedPageMessage, pageOutdated } from "@executor-js/dashboard-start/build-change";
 
 type Groups = (typeof HostedApi.groups)[keyof typeof HostedApi.groups];
 /** The hosted API owns its error algebra, including membership and authentication failures. */
@@ -71,6 +73,10 @@ const errorMessage = Match.type<HostedError>().pipe(
       error.reason === "conflict"
         ? "The source changed elsewhere. Reload it before saving again."
         : "The app source could not be saved or loaded. Check its files and try again.",
+    SourcePathConflict: ({ file, nested }) =>
+      `${file} is a file, so ${nested} cannot be inside it. Rename or remove one, then save again.`,
+    SourcePathNotUnicode: ({ path }) =>
+      `The file path ${JSON.stringify(path)} is not valid Unicode. Rename the file, then save again.`,
     AppNotFound: () => "This app is no longer available in this organization.",
     SkillRevisionChanged: () =>
       "Skills changed. Reload the skill to read its current instructions and references.",
@@ -113,7 +119,7 @@ const errorMessage = Match.type<HostedError>().pipe(
       "The tool needs approval, which this request cannot give, so Executor will not run the call from here. Run it from the app’s Tools tab to review it.",
     ToolRunApprovalRefused: (error) => `${error.description} ${error.recovery.action}`,
     ToolPolicyFailed: () =>
-      "The tool's approval policy could not be evaluated. The tool did not run. Check the policy code.",
+      "The tool's approval policy could not be evaluated. Check the policy code.",
     RequestInvalid: () => "The request is invalid. Check the input and try again.",
     ToolCallFailed: () =>
       "The tool failed. It may have already made changes. Check before trying again.",
@@ -172,13 +178,29 @@ const errorMessage = Match.type<HostedError>().pipe(
     CatalogUnavailable: () => "integrations.sh could not be reached. Try again.",
     FeedbackUnavailable: () => "Feedback could not be sent. Try again.",
     FeedbackDisabled: ({ message }) => message,
-    HttpClientError: () => "Could not reach the server. Check your connection and try again.",
-    SchemaError: () => "The server returned an unexpected response. Reload and try again.",
+    HttpClientError: () =>
+      pageOutdated()
+        ? outdatedPageMessage
+        : "Could not reach the server. Check your connection and try again.",
+    SchemaError: () =>
+      pageOutdated()
+        ? outdatedPageMessage
+        : "The server returned an unexpected response. Reload and try again.",
   }),
 );
-/** Safe copy for all expected failures. Defects never render their raw cause. */
+/**
+ * Safe copy for all expected failures. Defects never render their raw cause. A failed call that may
+ * have written shows the presentation every surface shows for it, with the write warning as its
+ * action, instead of the fixed copy above, which may advise another call.
+ */
 export const appError = (cause: Cause.Cause<HostedError>): string =>
   Option.match(Cause.findErrorOption(cause), {
-    onSome: errorMessage,
-    onNone: () => "Unable to complete this request. Try again.",
+    onSome: (error) => {
+      const written = mayHaveWrittenFailure(error);
+      return written === undefined
+        ? errorMessage(error)
+        : `${written.description} ${written.recovery.action}`;
+    },
+    onNone: () =>
+      pageOutdated() ? outdatedPageMessage : "Unable to complete this request. Try again.",
   });

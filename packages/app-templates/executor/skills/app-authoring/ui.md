@@ -33,9 +33,10 @@ The response is
 `{ status: "ready", url: "https://<app-slug>.<org-slug>.executor.website" }`
 on Executor Cloud. Self-host uses its configured app domain. Use the returned
 URL rather than constructing one. Before the first deployment it fails with
-`AppNotDeployed`. `url: null` with `status: "unavailable"` means the app has no
-UI or the host has no app domain configured; `"pending"` and `"failed"` report
-the setup of the team's app domain. Deployment builds and activates the UI;
+`AppNotDeployed`. `status: "unavailable"` has `url: null` and a `reason`:
+`"no_ui"` when the deployment has no UI, as for tool-only apps, or
+`"no_app_domain"` when the host has no app domain. `"pending"` and `"failed"`
+report the setup of the team's app domain. Deployment builds and activates the UI;
 there is no separate publish step. Give the URL to the user to open in a
 browser. The browser completes sign-in using their Executor session. MCP
 credentials do not grant a browser session. A `403` response alone does not

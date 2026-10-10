@@ -126,12 +126,14 @@ const treeUpstream = Effect.gen(function* () {
 /**
  * One app with both `accountRouter` callback forms integrations.md shows: a synchronous callback
  * returning `liveOpenapiRouter`, and a router of hand-written queries and mutations whose handlers
- * take `(_ctx, input)`. No casts, so it type-checks only if the framework's types accept them.
+ * take `(_ctx, input)`. `own.identity` is the custom tool beside the generated ones: it calls the
+ * same API with the account's credential. No casts, so it type-checks only if the framework's
+ * types accept them.
  */
 const routedAppFiles = (origin: string) => [
   {
     path: "index.ts",
-    content: `import { accountRouter, defineApp, defineProvider, mutation, object, query, router, secrets, string } from "apps";
+    content: `import { accountRouter, decodeJson, defineApp, defineProvider, mutation, object, query, router, secrets, string } from "apps";
 import { liveOpenapiRouter } from "apps/openapi";
 
 const service = defineProvider({
@@ -147,6 +149,14 @@ export default defineApp({ accounts: { service: service.many() } }, async ({ acc
         router({
           whoami: query({ input: object({}) }, async () => account.id),
           echo: mutation({ input: object({ text: string() }) }, async (_ctx, input) => input.text),
+          identity: query({ input: object({}) }, async ({ fetch }) =>
+            decodeJson(
+              await fetch(${JSON.stringify(`${origin}/identity`)}, {
+                headers: { Authorization: \`Bearer \${account.fields.token}\` },
+              }),
+              object({ account: string() }),
+            ),
+          ),
         }),
       { signal },
     ),
@@ -535,7 +545,7 @@ return { items: found.items, results };`,
         expect(
           (yield* body(Tools, tools)).items.map((item) => item.name).toSorted(),
           JSON.stringify(tools.body),
-        ).toEqual(["api.identity.getIdentity", "own.echo", "own.whoami"]);
+        ).toEqual(["api.identity.getIdentity", "own.echo", "own.identity", "own.whoami"]);
         const call = (
           tool: string,
           kind: "query" | "mutation",
@@ -561,6 +571,10 @@ return { items: found.items, results };`,
           const identity = yield* call("api.identity.getIdentity", "query", id, {});
           expect(identity.status, JSON.stringify(identity.body)).toBe(200);
           expect(identity.body).toEqual({ account: label });
+          // The custom tool sends the same account's credential as the generated one.
+          const custom = yield* call("own.identity", "query", id, {});
+          expect(custom.status, JSON.stringify(custom.body)).toBe(200);
+          expect(custom.body).toEqual({ account: label });
         }
       }),
     ),

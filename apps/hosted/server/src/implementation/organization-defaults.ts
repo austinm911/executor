@@ -238,7 +238,7 @@ export const organizationDefaults = (
                 saved !== undefined
                   ? saved
                   : token !== undefined
-                    ? yield* executor.accounts
+                    ? yield* executor.managedAccounts
                         .add({
                           owner,
                           provider: requirement.provider,

@@ -10,6 +10,7 @@ import {
   version404Tables,
   version405Tables,
   version406Tables,
+  version407Tables,
   version4Tables,
 } from "./storage-schema.ts";
 
@@ -115,6 +116,27 @@ export const storageSchemas = [
     },
   }),
   // Additive: three event tables and their indexes, which the running server never names.
+  schema({
+    version: "4.0.7",
+    tables: version407Tables,
+    up: ({ auto }) =>
+      auto.pipe(
+        Effect.map((operations) => [
+          ...operations,
+          ...eventIndexes.map((sql) => ({ type: "custom" as const, sql })),
+        ]),
+      ),
+    relations: {
+      accounts: ({ one }) => ({
+        providerDefinition: one("providers", ["provider", "id"]).foreignKey(),
+      }),
+      apps: ({ one }) => ({
+        deployment: one("deployments", ["activeDeployment", "id"], ["code", "code"]).foreignKey(),
+      }),
+    },
+  }),
+  // Deletes connections without a target, then requires one. The running server has written a
+  // target on every connection since #2135 and reads the column as nullable, so it is unaffected.
   storageSchema,
 ] as const;
 

@@ -302,8 +302,10 @@ export const hostedAppUi = <R = never>(
         const page = yield* assets(version, "index.html").pipe(
           Effect.mapError(() => new AppUiUnavailable()),
         );
-        if (!addresses.enabled || page === undefined)
-          return { status: "unavailable" as const, url: null };
+        if (page === undefined)
+          return { status: "unavailable" as const, url: null, reason: "no_ui" as const };
+        if (!addresses.enabled)
+          return { status: "unavailable" as const, url: null, reason: "no_app_domain" as const };
         const sessions = yield* HostedAppSessions;
         const organization = yield* sessions
           .organization({ id: access.organization })

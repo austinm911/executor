@@ -13,6 +13,7 @@ import {
 } from "./config.ts";
 import { installWindowsGitHttpBackend } from "./windows-git.ts";
 import { launcherAnalytics } from "./analytics.ts";
+import { npmCommand } from "./npm.ts";
 
 const build = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -126,14 +127,7 @@ if (backend.status !== 0 || !backend.stdout.includes("Status: 404")) {
     ],
     stage,
   );
-  // Windows npm is a shell wrapper. Invoke its JavaScript entry with Node, without a shell.
-  const npm =
-    process.platform === "win32"
-      ? {
-          command: process.execPath,
-          prefix: [path.join(path.dirname(process.execPath), "node_modules/npm/bin/npm-cli.js")],
-        }
-      : { command: "npm", prefix: [] };
+  const npm = yield* npmCommand;
   yield* run(
     npm.command,
     [...npm.prefix, "pack", "--ignore-scripts", "--pack-destination", output],

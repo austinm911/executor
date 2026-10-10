@@ -29,14 +29,14 @@ export const gitSourceStorage = (repositories: RepositoryBackend): AppSourceStor
     ),
   commit: (input) =>
     Effect.gen(function* () {
-      const commit = yield* repositories.commit({
+      const { commit, removed } = yield* repositories.commit({
         id: input.code,
         branch: "main",
         expected: input.expected,
         files: input.files,
         message: input.message,
       });
-      return { revision: { code: input.code, commit }, files: input.files };
+      return { revision: { code: input.code, commit }, files: input.files, removed };
     }),
   read: ({ code, commit }) =>
     repositories.read(code, commit).pipe(Effect.map((snapshot) => snapshot.files)),
@@ -58,6 +58,7 @@ export const gitSourceStorage = (repositories: RepositoryBackend): AppSourceStor
         (yield* repositories
           .commit({ id: code, branch, expected: null, files, message: "Retain app source" })
           .pipe(
+            Effect.map(({ commit }) => commit),
             Effect.catchTag("SourceError", (error) =>
               error.reason === "conflict"
                 ? repositories

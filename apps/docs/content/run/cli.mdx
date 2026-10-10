@@ -50,9 +50,29 @@ value that does not match the directory stops startup and changes nothing.
 | `executor apps` | Create, edit, deploy and install apps. See [Author an app](/author-an-app). |
 | `executor rotate-key` | Replace the saved API key. Restart Executor, then update clients that used the old key. |
 
-There is no `executor mcp` command. That started a stdio MCP server in
-Executor 1. Executor 2 serves MCP over HTTP from the running server, so point
-clients at `http://127.0.0.1:4312/mcp`; see [Connect an agent](#connect-an-agent).
+`executor pair` asks the server on `EXECUTOR_PORT` for a link, using the API key
+saved in `EXECUTOR_DATA_DIR`, or `EXECUTOR_API_KEY` when you set it. Run it with
+the same values as the server. It only reads the key: it never creates a data
+directory or keys. If it reports that the server did not accept the key, the
+server uses another data directory, or its key was rotated and it has not
+restarted yet. Executor desktop keeps its own data directory; use its
+**File > Open in browser** menu item instead.
+
+### Coming from Executor 1
+
+Executor 2 answers the old commands with the command to run instead.
+
+| Executor 1 | Executor 2 |
+| --- | --- |
+| `executor web` | `executor` starts the server and opens the dashboard. If the server is already running, `executor pair` prints a link to open instead. |
+| `executor open` | `executor pair` prints a connection link for the running server. |
+| `executor daemon run` | `executor serve` starts the server without opening a browser. |
+| `executor install`, `executor service install` | No background service yet. Keep `executor serve` running while your agents use Executor. |
+| `executor mcp` | The running server serves MCP over HTTP at `http://127.0.0.1:4312/mcp`; see [Connect an agent](#connect-an-agent). |
+| `executor call`, `executor tools`, `executor resume` | Agents call tools through the MCP endpoint. |
+| `executor server` | No server profiles. `executor apps` commands take `--host`, and `executor rotate-key` replaces `executor server rotate-token`. |
+| `executor login` | `executor apps login --host https://api.executor.sh` signs in to hosted Executor for app commands. |
+| `executor docs` | Open [executor.sh/docs](https://executor.sh/docs). |
 
 ## Configure it
 

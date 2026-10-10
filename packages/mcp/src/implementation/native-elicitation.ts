@@ -26,7 +26,7 @@ export const executeNative = (
         return yield* new NativeElicitationFailed({ reason: "unsupported" });
       }
       const reverse = yield* client.value.getClient;
-      let result = yield* executions.execute(caller, backend, code);
+      let result = yield* executions.execute(caller, backend, code, "prompt");
       while (result.status === "approval-required" || result.status === "input-required") {
         const request = result;
         result = yield* Effect.gen(function* () {

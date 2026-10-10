@@ -14,7 +14,7 @@ export const makeExecutorStorage = (options: { readonly provider: SqlProvider })
     const sql = yield* SqlClient.SqlClient;
     const reactivity = yield* makeReactiveStore({ namespace: "executor" });
     const client = executorDatabase.client(sqlAdapter({ provider: options.provider }));
-    const db = bindOrm(client.orm("4.0.7"), sql, reactivity);
+    const db = bindOrm(client.orm("4.0.8"), sql, reactivity);
     const checkMigration = Effect.gen(function* () {
       const migrator = yield* client.createMigrator;
       const version = yield* migrator.version;
@@ -46,7 +46,7 @@ export const makeExecutorStorage = (options: { readonly provider: SqlProvider })
       Effect.provideService(SqlClient.SqlClient, sql),
       Effect.mapError(() => new StorageError()),
     );
-    return { orm: (_version: "4.0.7") => db, reactivity, checkMigration, migrate };
+    return { orm: (_version: "4.0.8") => db, reactivity, checkMigration, migrate };
   });
 /** Caller-owned, Effect-native persistence with commit-driven subscriptions. */
 export type ExecutorDatabase = Effect.Success<ReturnType<typeof makeExecutorStorage>>;

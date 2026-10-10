@@ -40,6 +40,16 @@ export interface ToolListing {
 export type ListingFailure = AppEvaluationFailed | AppProviderFailed | ToolListingTimedOut;
 type ResolveError = Effect.Error<ReturnType<typeof resolve>>;
 
+/** How an in-process caller reads a listing. */
+interface ListingRead extends ToolListOptions {
+  /**
+   * The accounts the caller already resolved for this invocation state, such as a tool call
+   * reading the tool's kind. An evaluation this read starts uses them instead of resolving the
+   * accounts again, which would renew a grant inside its renewal window a second time.
+   */
+  readonly resolved?: Effect.Success<ReturnType<typeof resolve>>;
+}
+
 /** A kept listing. */
 class Listed {
   readonly listing: ToolListing;
@@ -96,7 +106,8 @@ type Outcome = Evaluated | Failed | Unkept | Stopped;
  * an evaluation another request started.
  *
  * A listing younger than `freshMillis` is served as is; an older one is served while one
- * background evaluation replaces it; past `maxStaleMillis` the read evaluates first. Readers of a
+ * background evaluation replaces it, or as is to a reader that passes `refreshStale: false`; past
+ * `maxStaleMillis` the read evaluates first. Readers of a
  * key share one evaluation. A first evaluation runs in the background when the host allows it,
  * so a reader that stops waiting, such as MCP discovery giving up on a stalled app, leaves it
  * running until `loadMillis` or until the host ends its background work, whichever is first, and
@@ -124,13 +135,15 @@ export const makeListings = (options: {
       evaluate: (
         context: Effect.Success<ReturnType<typeof resolve>>,
       ) => Effect.Effect<ToolListing, AppEvaluationFailed | AppProviderFailed | ResolveError>,
-      read: ToolListOptions = {},
+      read: ListingRead = {},
     ) =>
       Effect.gen(function* () {
         const identity = { app: state.app.id, deployment: state.deployment.id };
-        const evaluated = resolve(state, options.resolveAccount, options.lifecycle).pipe(
-          Effect.flatMap(evaluate),
-        );
+        const evaluated = (
+          read.resolved === undefined
+            ? resolve(state, options.resolveAccount, options.lifecycle)
+            : Effect.succeed(read.resolved)
+        ).pipe(Effect.flatMap(evaluate));
         if (policy.maxStaleMillis <= 0) return yield* evaluated;
         const id = yield* options.declarations.key("tools.list", state);
         const now = yield* Clock.currentTimeMillis;
@@ -317,11 +330,16 @@ export const makeListings = (options: {
             return yield* outcome(done.value);
           });
 
-        // Without background work a stale listing is evaluated again first, like a missing one.
+        // A reader that refreshes a stale listing needs background work to do so; without it the
+        // listing is evaluated again first, like a missing one.
+        const refreshes = read.refreshStale !== false;
         const servable = (at: number) =>
           now - at < policy.freshMillis ||
-          (now - at < policy.maxStaleMillis && background !== undefined);
-        /** Serve a kept listing, refreshing it in the background once it is past `freshMillis`. */
+          (now - at < policy.maxStaleMillis && (background !== undefined || !refreshes));
+        /**
+         * Serve a kept listing, refreshing it in the background once it is past `freshMillis`
+         * unless the reader asked not to.
+         */
         const serve = (at: number, listed: Listed, source: "memory" | "durable") =>
           Effect.gen(function* () {
             yield* authorize;
@@ -331,7 +349,7 @@ export const makeListings = (options: {
               "executor.declarations.source": source,
               "executor.declarations.age_ms": now - at,
             });
-            if (stale) yield* refresh;
+            if (stale && refreshes) yield* refresh;
             return listed.listing;
           });
 
@@ -375,8 +393,10 @@ export const makeListings = (options: {
             ),
           ),
         );
+        // A reader that does not refresh waits for the whole durable read: an evaluation beside
+        // it would load the app's Worker and replace the kept listing the read then serves.
         const recalled = yield* Fiber.join(recalling).pipe(
-          Effect.timeoutOption(durableHeadStartMillis),
+          refreshes ? Effect.timeoutOption(durableHeadStartMillis) : Effect.map(Option.some),
         );
         if (Option.isSome(recalled) && recalled.value !== undefined)
           return yield* serve(recalled.value.at, recalled.value.listed, "durable");

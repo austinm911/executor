@@ -52,15 +52,11 @@ export const executorHandlers = (executor: Executor) =>
     ),
     HttpApiBuilder.group(ExecutorApi, "accounts", (handlers) =>
       handlers
-        .handle("add", ({ payload }) => executor.accounts.add(payload))
         .handle("update", ({ params, query, payload }) =>
           executor.accounts.update({ ...params, ...query, ...payload }),
         )
         .handle("provider", ({ params, query }) =>
           executor.accounts.provider({ ...params, ...query }),
-        )
-        .handle("replaceCredentials", ({ params, query, payload }) =>
-          executor.accounts.replaceCredentials({ ...params, ...query, ...payload }),
         )
         .handle("remove", ({ params, query }) => executor.accounts.remove({ ...params, ...query }))
         .handle("signIn", ({ params, query }) => executor.accounts.signIn({ ...params, ...query }))

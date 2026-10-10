@@ -7,16 +7,22 @@ import { fileURLToPath } from "node:url";
 import { Console, Effect, Option, Schema } from "effect";
 import { CliError, Command } from "effect/cli";
 import {
+  LegacyCommand,
+  PairFailed,
   executorCommand,
+  legacyCommands,
   pairCommand,
   rotateKeyCommand,
   serveCommand,
 } from "./contracts/startup.ts";
 import { LocalConfigurationError, rotateApiKey } from "./implementation/bootstrap.ts";
 import { launch } from "./implementation/launcher.ts";
+import { pair } from "./implementation/pair.ts";
 
 // The installed runtime's own path shows which package manager installed it.
 const installation = fileURLToPath(import.meta.url);
+/** Failures whose message is written for the person running the command. */
+const explained = Schema.is(Schema.Union([LocalConfigurationError, PairFailed, LegacyCommand]));
 
 const cli = executorCommand.pipe(
   Command.withHandler(({ bootstrapFd }) =>
@@ -27,7 +33,7 @@ const cli = executorCommand.pipe(
     serveCommand.pipe(
       Command.withHandler(() => launch("headless", process.platform, installation)),
     ),
-    pairCommand.pipe(Command.withHandler(() => launch("pair", process.platform))),
+    pairCommand.pipe(Command.withHandler(() => pair(process.platform))),
     rotateKeyCommand.pipe(
       Command.withHandler(() =>
         rotateApiKey(process.platform).pipe(
@@ -37,6 +43,11 @@ const cli = executorCommand.pipe(
             ),
           ),
         ),
+      ),
+    ),
+    ...legacyCommands.map((legacy) =>
+      legacy.pipe(
+        Command.withHandler(() => Effect.fail(new LegacyCommand({ command: legacy.name }))),
       ),
     ),
   ]),
@@ -52,7 +63,7 @@ NodeRuntime.runMain(
       CliError.isCliError(error)
         ? Effect.fail(error)
         : Console.error(
-            (Schema.is(LocalConfigurationError)(error) ? error.message : undefined) ??
+            (explained(error) ? error.message : undefined) ??
               appCommandFailure(error) ??
               "Executor could not start. Check the configured keys and whether the port is already in use.",
           ).pipe(

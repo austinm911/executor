@@ -14,10 +14,11 @@ import {
 } from "apps/contracts";
 import { ApiError } from "@executor-js/utils/api-error";
 import { ProfileId } from "./shared.ts";
-import { UserFacingError } from "@executor-js/utils/user-facing-error";
+import { type ErrorPresentation, UserFacingError } from "@executor-js/utils/user-facing-error";
 import { ProfileErrors, ProfileRevision } from "./profiles.ts";
+import { callPresentation, type CausePresentation, MayHaveWritten } from "./call-presentation.ts";
 /** Existing tool call seam, using the configured app's saved accounts. Discovery design is deferred. */
-import { Option, Schema } from "effect";
+import { Match, Option, Schema } from "effect";
 import {
   ApprovalElicitation,
   ApprovalResponse,
@@ -30,6 +31,7 @@ import {
   type ElicitationHandler,
 } from "apps/contracts";
 import { StorageError, CredentialsError, RequestInvalid } from "./shared.ts";
+import type { CatalogReadOptions } from "./declarations.ts";
 import { HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/http-api";
 import {
   AccountId,
@@ -72,7 +74,7 @@ export interface ToolInvocationOptions {
   readonly issuer?: ToolApprovalIssuer;
 }
 /** How an in-process caller with its own wait bound reads a tool listing. Not an HTTP input. */
-export interface ToolListOptions {
+export interface ToolListOptions extends CatalogReadOptions {
   /**
    * Report a listing that another request started at least this long ago, and that is still
    * running, as `ToolListingTimedOut` at once instead of waiting for it. A caller that gives up
@@ -88,17 +90,135 @@ export {
   type ElicitationResponse,
 } from "apps/contracts";
 
-/** A running tool could not complete its user interaction. Earlier effects may have completed. */
+/**
+ * Copy for a refusal the app's reply reports, which has no presentation of its own. `message` is
+ * what a caller of a query is told. `description` states what happened without advising another
+ * call or claiming what ran; `recovery`, when a query's caller has one, is that caller's advice.
+ */
+interface RefusalCopy {
+  readonly message: string;
+  readonly title: string;
+  readonly description: string;
+  readonly recovery?: ErrorPresentation["recovery"];
+}
+
+/**
+ * A refusal's recovery for a call that may have written, when a query's caller would get none.
+ * The app's reply refused the call after its code received the call.
+ */
+const refusalRecovery = {
+  action: "Read the app’s refusal before another call.",
+  instructions:
+    "The app’s reply refused this call after its code received it, so the refusal does not show what ran.",
+};
+
+/** A refusal's presentation, through `callPresentation`; a query's refusal without recovery has none. */
+const refusalPresentation =
+  <Fields>(copy: (fields: Fields) => RefusalCopy) =>
+  (
+    fields: Fields & { readonly mayHaveWritten?: true | undefined },
+  ): ErrorPresentation | undefined => {
+    const { title, description, recovery } = copy(fields);
+    if (recovery === undefined && fields.mayHaveWritten !== true) return undefined;
+    return callPresentation(() => ({
+      title,
+      description,
+      ...(recovery === undefined ? { recovery: refusalRecovery, forWrite: true } : { recovery }),
+      retryable: false,
+    }))(fields);
+  };
+
+/**
+ * A refusal's message. A call that may have written leads with Executor's instruction not to
+ * repeat it, then states what happened; it has no recovery field, so the message carries both.
+ */
+const refusalMessage =
+  <Fields>(copy: (fields: Fields) => RefusalCopy) =>
+  (fields: Fields & { readonly mayHaveWritten?: true | undefined }): string => {
+    const presented =
+      fields.mayHaveWritten === true ? refusalPresentation(copy)(fields) : undefined;
+    return presented === undefined
+      ? copy(fields).message
+      : `${presented.recovery.action} ${presented.description}`;
+  };
+
+/**
+ * A cause's presentation for a call that may have written, for callers that present a failure
+ * themselves rather than through its class or `callFailurePresentation`.
+ */
+export const mayHaveWrittenPresentation = (presented: ErrorPresentation): ErrorPresentation =>
+  callPresentation(() => presented)({ mayHaveWritten: true });
+
+/**
+ * The same failure, recording that its operation may change data and may have begun. It is
+ * encoded and decoded again with `mayHaveWritten`, so the class presents it as its own.
+ */
+export const mayHaveWritten = <A extends { readonly mayHaveWritten?: true | undefined }, I>(
+  schema: Schema.Codec<A, I>,
+  failure: A,
+): A =>
+  Schema.decodeUnknownSync(schema)({ ...Schema.encodeSync(schema)(failure), mayHaveWritten: true });
+
+/** Why a running tool could not complete its user interaction. */
 const elicitationFailures = {
-  unavailable: "The tool asked for input, but this caller cannot answer input requests.",
+  unavailable: "The tool requested input, but input delivery was unavailable for this invocation.",
   transaction: "The tool asked for input inside a database transaction, which is not allowed.",
   "invalid-request": "The tool's input request was invalid.",
-  "invalid-response": "The answer did not match the input the tool requested.",
-  transport: "The tool's input request could not be delivered.",
-  expired: "The tool's input request expired before it was answered.",
+  "invalid-response": "The input response did not match the tool's request.",
+  transport: "The tool’s input request or answer could not be delivered.",
+  expired: "The tool’s input request expired before Executor received an answer.",
   forbidden: "This caller may no longer answer the tool's input request.",
 } as const;
-export const ToolElicitationFailed = ApiError.define({
+/**
+ * What to do about each failed input request, and whether repeating the call unchanged can help.
+ * Repeat advice is for a read: a call that may have written is presented without it.
+ */
+const elicitationRecovery = {
+  unavailable: {
+    action: "Use a supported input-delivery path.",
+    instructions:
+      "Check whether the client supports input requests or the invocation ended. Use a supported input-delivery path, or tell the user the tool needs their input.",
+    retryable: false,
+  },
+  transaction: {
+    action: "Change the app so the tool asks for input outside its database transaction.",
+    instructions:
+      "The tool requested input while its database transaction was open. Collect any input needed for the write before opening the transaction.",
+    retryable: false,
+  },
+  "invalid-request": {
+    action: "Check the tool’s input request before changing the app.",
+    instructions:
+      "Executor could not accept or record the tool’s input request. Check its form and delivery limits before changing the app.",
+    retryable: false,
+  },
+  "invalid-response": {
+    action: "Correct the input response before another attempt.",
+    instructions:
+      "The input response did not match the requested form or response format. Correct it before another attempt. If the execution is still paused, answer through resume.",
+    retryable: true,
+  },
+  transport: {
+    action: "Try again once. If it fails again, tell the user the tool’s input request fails.",
+    instructions:
+      "For a read, one further attempt may help. If it fails again, tell the user the tool’s input request fails.",
+    retryable: true,
+  },
+  expired: {
+    action: "Call the tool again when the user can answer its input request.",
+    instructions:
+      "Retry a read when the user can answer. Check delivery if an answer was already sent.",
+    retryable: true,
+  },
+  forbidden: {
+    action: "Confirm or restore access to the app and its accounts before another attempt.",
+    instructions:
+      "Executor checks the caller's access before it delivers an input request, and that check was refused, such as after access changed while the tool was waiting. Confirm or restore the caller's access to the app and its accounts before another attempt.",
+    retryable: false,
+  },
+} as const;
+/** A running tool could not complete its user interaction. Earlier effects may have completed. */
+export const ToolElicitationFailed = UserFacingError.define({
   tag: "ToolElicitationFailed",
   status: 422,
   fields: {
@@ -106,9 +226,18 @@ export const ToolElicitationFailed = ApiError.define({
     deployment: DeploymentId,
     tool: ToolName,
     reason: ElicitationFailed.fields.reason,
+    mayHaveWritten: MayHaveWritten,
   },
-  message: ({ reason }) => elicitationFailures[reason],
   recorded: ({ reason }) => elicitationFailures[reason],
+  presentation: callPresentation(({ reason }) => {
+    const { action, instructions, retryable } = elicitationRecovery[reason];
+    return {
+      title: "The tool needed more input",
+      description: elicitationFailures[reason],
+      recovery: { action, instructions },
+      retryable,
+    };
+  }),
 });
 export type ToolElicitationFailed = typeof ToolElicitationFailed.Type;
 
@@ -355,7 +484,13 @@ const recordedApp = ({ source }: AppFailure) =>
 const recordedMcp = ({ phase, reason, status }: McpFailure) =>
   `the app's MCP server failed during ${phase} (${reason})${recordedStatus(status)}`;
 
-/** Present an MCP server failure from its safe phase, reason, HTTP status and JSON-RPC error. */
+/**
+ * Present an MCP server failure from its safe phase, reason, HTTP status and JSON-RPC error. The
+ * app reports all of them, so they choose the copy and a read's retry policy, but never claim that
+ * a request was not sent or changed nothing. A failed tool call's presentation is for a read; a
+ * call that may have written is presented with Executor's instruction first and is never retryable
+ * (see `callPresentation`), whatever the reason.
+ */
 export const mcpFailurePresentation = ({
   phase,
   reason,
@@ -378,13 +513,23 @@ export const mcpFailurePresentation = ({
       : phase === "call"
         ? "calling a tool"
         : "listing its tools";
-  const verify =
-    phase === "call"
-      ? "Before repeating the call, check whether it already made changes, then verify that it succeeds."
-      : "Verify that the Tools page loads after the repair.";
-  const instructions = `The app's MCP server failed while ${stage}. Inspect the app's MCP server URL, transport and account requirements from its source or import settings. Do not print credentials or raw responses, and do not change accounts automatically. ${verify}`;
+  const instructions =
+    "Use the reported phase and error to identify the failure. Check the server URL, transport or access settings only when relevant. Do not expose credentials.";
   switch (reason) {
     case "timeout":
+      // A server that did not answer one call may answer the next, so a read may be repeated
+      // once; a second timeout is investigated before repeating it again.
+      if (phase === "call")
+        return {
+          title: "MCP server did not answer the tool call",
+          description: `The app’s MCP server did not answer the tool call in time, so Executor stopped waiting. The server may still finish it.${answered}`,
+          recovery: {
+            action: "You may retry once. If it times out again, investigate before repeating it.",
+            instructions:
+              "The server may still complete the first attempt. For a read, you may retry once; if it times out again, check the server’s status before repeating it. Reduce the input only if that still meets the task. Do not expose credentials.",
+          },
+          retryable: true,
+        };
       return {
         title: "MCP server did not respond",
         description: `The app’s MCP server did not respond in time while ${stage}.${answered}`,
@@ -399,7 +544,8 @@ export const mcpFailurePresentation = ({
         title: "MCP server rejected the credentials",
         description: `The app’s MCP server rejected the credentials${http}.${answered}`,
         recovery: {
-          action: "Check the account’s credentials. Update its API key or reconnect its sign-in.",
+          action:
+            "Check how the request authenticates. Update credentials or reconnect only if the evidence requires it.",
           instructions,
         },
         retryable: false,
@@ -409,18 +555,23 @@ export const mcpFailurePresentation = ({
         title: "MCP server response not supported",
         // Includes Executor refusing to follow the server to another origin.
         description: `The app’s MCP server returned a response Executor could not use while ${stage}, such as an unreadable message or an address on another origin.${answered}`,
-        recovery: { action: "Check that the app points at a supported MCP server.", instructions },
+        recovery: {
+          action: "Check the response compatibility and the app’s MCP server configuration.",
+          instructions,
+        },
         retryable: false,
       };
     case "invalid_input":
-      // A call's input that cannot be sent as the tool's arguments never reached the server.
+      // The app reports this reason, so the copy does not claim the call was not sent.
       return phase === "call"
         ? {
-            title: "Tool input not sent",
-            description: "The input could not be sent to the app’s MCP server as tool arguments.",
+            title: "Tool input could not be used",
+            description:
+              "The app reported that it could not use the input as the MCP tool’s arguments.",
             recovery: {
               action: "Pass the tool an object that matches its input schema.",
-              instructions,
+              instructions:
+                "The input could not be encoded as the tool's arguments. Pass an object that matches the tool's input schema; a call with corrected input is a new call.",
             },
             retryable: false,
           }
@@ -435,9 +586,10 @@ export const mcpFailurePresentation = ({
       if (status === 408 || status === 425)
         return {
           title: "MCP server asked to retry",
-          description: `The app’s MCP server could not handle the request yet while ${stage}${http}.${answered}`,
+          description: `The app’s MCP server returned HTTP ${status} while ${stage}.${answered}`,
           recovery: {
-            action: "Try again later. If this continues, check the MCP server’s status.",
+            action:
+              "Try again later, at most once. If it fails again, check the MCP server’s status.",
             instructions,
           },
           retryable: true,
@@ -469,7 +621,8 @@ export const mcpFailurePresentation = ({
         };
       // A JSON-RPC error inside a successful response, such as arguments a tool rejects, states
       // the server's error. Without one, a transport failure got no answer from the server: it
-      // may not be reachable, or Executor's own request failed.
+      // may not be reachable, or Executor's own request failed. A tool call that failed without an
+      // answer, such as on a dropped connection, may have run.
       return upstream === undefined
         ? phase === "transport"
           ? {
@@ -481,23 +634,32 @@ export const mcpFailurePresentation = ({
               },
               retryable: true,
             }
-          : {
-              title: "MCP server request failed",
-              description: `The request to the app’s MCP server failed while ${stage}.`,
-              recovery: {
-                action: "Try again. If this continues, check the MCP server’s status.",
-                instructions,
-              },
-              retryable: true,
-            }
+          : phase === "call"
+            ? {
+                title: "Tool call ended without an answer",
+                description:
+                  "The request to the app’s MCP server failed before the server answered the tool call, so Executor cannot tell whether the server ran it.",
+                recovery: {
+                  action:
+                    "Retry at most once. If it fails again, check the server’s status and connection.",
+                  instructions: `For a read, retry at most once. If it fails again, check the server’s status and connection. ${instructions}`,
+                },
+                retryable: true,
+              }
+            : {
+                title: "MCP server request failed",
+                description: `The request to the app’s MCP server failed while ${stage}.`,
+                recovery: {
+                  action: "Try again once. If it fails again, check the MCP server’s status.",
+                  instructions,
+                },
+                retryable: true,
+              }
         : {
             title: "MCP server returned an error",
             description: `The app’s MCP server returned an error while ${stage}.${answered}`,
             recovery: {
-              action:
-                phase === "call"
-                  ? "Read the server’s error, then correct the tool’s input or the server’s access."
-                  : "Read the server’s error, then correct the app’s MCP server settings or access.",
+              action: "Read the server’s error to determine the next step.",
               instructions,
             },
             retryable: false,
@@ -505,7 +667,11 @@ export const mcpFailurePresentation = ({
   }
 };
 
-/** Evaluating the app's live definition failed before any tool ran. */
+/**
+ * Evaluating the app's live definition failed before any tool ran. With `mayHaveWritten`, it
+ * failed during a call that may write, after the host handed the call to the app's code, which
+ * includes its factory: that code may have made changes before the failure, whatever it reports.
+ */
 export const AppEvaluationFailed = UserFacingError.define({
   tag: "AppEvaluationFailed",
   status: 502,
@@ -529,6 +695,7 @@ export const AppEvaluationFailed = UserFacingError.define({
      * including the session a tool call opens, or while listing its tools.
      */
     mcp: Schema.optional(McpFailure),
+    mayHaveWritten: MayHaveWritten,
   },
   recorded: ({ skills, mcp, failure }) =>
     `Tools could not be loaded: ${
@@ -540,7 +707,7 @@ export const AppEvaluationFailed = UserFacingError.define({
             ? `the app's skill source failed (${skills.reason})${recordedStatus(skills.status)}`
             : "the app's definition could not be evaluated"
     }`,
-  presentation: ({ skills, mcp, failure }) =>
+  presentation: callPresentation(({ skills, mcp, failure }) =>
     mcp !== undefined
       ? mcpFailurePresentation(mcp)
       : failure !== undefined
@@ -564,6 +731,7 @@ export const AppEvaluationFailed = UserFacingError.define({
               retryable: true,
             }
           : skillPresentation(skills),
+  ),
 });
 /** Parsed evaluation failure; raw runtime diagnostics never enter its presentation. */
 export type AppEvaluationFailed = typeof AppEvaluationFailed.Type;
@@ -603,6 +771,58 @@ export const ToolListingTimedOut = UserFacingError.define({
 });
 export type ToolListingTimedOut = typeof ToolListingTimedOut.Type;
 
+/** Why renewing an account's refused credentials failed, as resolving them reports it. */
+export const RenewalFailure = Schema.Union([
+  OAuthReconnectRequired,
+  OAuthRenewalFailed,
+  StorageError,
+  CredentialsError,
+]);
+export type RenewalFailure = typeof RenewalFailure.Type;
+
+/**
+ * What to do about a renewal that failed after a call that may write was dispatched. The
+ * renewal's own recovery is written for an operation that may be repeated, so it is replaced: a
+ * failure Executor's storage caused names what to check, a reconnect or a non-temporary refusal
+ * keeps its steps. A temporary refusal is not renewed again until access is due for renewal or
+ * refused again, so its recovery says only what may trigger renewal and when to reconnect, and
+ * leaves out its own advice.
+ */
+const renewalRecovery = (
+  failure: RenewalFailure,
+): Pick<CausePresentation, "recovery" | "forWrite"> => {
+  switch (failure._tag) {
+    case "StorageError":
+      return {
+        recovery: {
+          action: "Check Executor’s storage availability.",
+          instructions: failure.recovery.instructions,
+        },
+      };
+    case "CredentialsError":
+      return {
+        recovery: {
+          action: "Check Executor’s credential storage and encryption-key availability.",
+          instructions: failure.recovery.instructions,
+        },
+      };
+    case "OAuthReconnectRequired":
+      return { recovery: failure.recovery };
+    case "OAuthRenewalFailed":
+      return failure.retryable
+        ? {
+            recovery: {
+              action:
+                "Respect any wait specified by the renewal error; a later safe read that uses this account may trigger renewal when access is due for renewal or rejected again.",
+              instructions:
+                "If renewal keeps failing, inspect its error and reconnect only when the service indicates it is needed.",
+            },
+            forWrite: true,
+          }
+        : { recovery: failure.recovery };
+  }
+};
+
 /** Recognized provider failure, enriched only with trusted selected-account metadata. */
 export const AppProviderFailed = UserFacingError.define({
   tag: "AppProviderFailed",
@@ -625,82 +845,99 @@ export const AppProviderFailed = UserFacingError.define({
      * refusal; a later call uses the renewed credentials.
      */
     credentialsRenewed: Schema.optional(Schema.Literal(true)),
+    /**
+     * The service refused the account's credentials during a call that may write, and renewing
+     * them failed with this error. The call was not repeated.
+     */
+    renewalFailure: Schema.optional(RenewalFailure),
+    mayHaveWritten: MayHaveWritten,
   },
   recorded: ({ reason, status, phase }) =>
     `The connected service failed (${reason})${recordedStatus(status)}${phaseText(phase)}`,
-  presentation: ({ reason, status, phase, upstream, account, credentialsRenewed }) => {
-    const service = account === undefined ? "The connected service" : account.provider;
-    const target = account === undefined ? "" : ` for account “${account.label}”`;
-    /** The HTTP status, then the phase the failure happened in. */
-    const context = `${status === undefined ? "" : ` (HTTP ${status})`}${phaseText(phase)}`;
-    const reported = upstreamText(upstream, "The service reported");
-    const instructions =
-      "Use the selected app and profile. Inspect only safe status codes and documented provider error codes. Do not print credentials or raw responses, switch accounts, or change authentication methods automatically. Verify tool discovery and a safe read after the repair. Before repeating a failed operation, check whether it already made changes.";
-    switch (reason) {
-      case "unavailable":
-        return {
-          title: "Service temporarily unavailable",
-          description: `${service} returned a server error${context}.${reported}`,
-          recovery: {
-            action: "Try again. If this continues, check the service’s status and server address.",
-            instructions: `The upstream returned a server error. Do not replace credentials or change authentication to address a service outage. ${instructions}`,
-          },
-          retryable: true,
-        };
-      case "unauthorized":
-        if (credentialsRenewed === true)
+  presentation: callPresentation(
+    ({ reason, status, phase, upstream, account, credentialsRenewed, renewalFailure }) => {
+      const service = account === undefined ? "The connected service" : account.provider;
+      const target = account === undefined ? "" : ` for account “${account.label}”`;
+      /** The HTTP status, then the phase the failure happened in. */
+      const context = `${status === undefined ? "" : ` (HTTP ${status})`}${phaseText(phase)}`;
+      const reported = upstreamText(upstream, "The service reported");
+      const instructions =
+        "Do not print credentials or raw responses, switch accounts, or change authentication methods automatically.";
+      switch (reason) {
+        case "unavailable":
           return {
-            title: "Access renewed; request not repeated",
-            description: `${service} rejected the credentials${target}${context}.${reported} Executor has renewed the account’s access, but did not repeat this change automatically.`,
+            title: "Service temporarily unavailable",
+            description: `${service} returned a server error${context}.${reported}`,
             recovery: {
               action:
-                "Check whether the change was already made, then try again. The renewed access is used from now on.",
-              instructions: `The provider rejected the account’s previous access token and Executor renewed it. Mutations are never repeated automatically: an earlier request in the same call may already have made changes. ${instructions}`,
+                "Wait at least 30 seconds before trying again, at most twice. If it keeps failing, report the repeated server error.",
+              instructions: `The response does not identify the root cause. Check service status and request-specific diagnostics if available. Do not change credentials without authentication evidence. ${instructions}`,
             },
             retryable: true,
           };
-        return {
-          title: "Authentication failed",
-          description: `${service} rejected the credentials${target}${context}.${reported}`,
-          recovery: {
-            action:
-              "Check the account’s credentials. Update its API key or reconnect its sign-in, then try again.",
-            instructions: `The provider rejected authentication. This does not establish whether credentials are expired, revoked, missing, or sent incorrectly. ${instructions}`,
-          },
-          retryable: false,
-        };
-      case "forbidden":
-        return {
-          title: "Permission required",
-          description: `${service} reported insufficient permission${target}${context}.${reported}`,
-          recovery: {
-            action: "Check the account’s permissions and the service’s access requirements.",
-            instructions: `The provider explicitly reported insufficient permission. Do not invent required scopes or organization approval requirements. ${instructions}`,
-          },
-          retryable: false,
-        };
-      case "rate_limited":
-        return {
-          title: "Service rate limit reached",
-          description: `${service} is limiting requests${target}${context}.${reported}`,
-          recovery: {
-            action: "Wait for the service’s rate limit to reset before trying again.",
-            instructions: `The provider reported a rate limit. Do not replace credentials to fix it. ${instructions}`,
-          },
-          retryable: true,
-        };
-      case "rejected":
-        return {
-          title: "Service rejected the request",
-          description: `${service} refused the request${target}${context}.${reported === "" ? " We could not identify the cause from the available error details." : reported}`,
-          recovery: {
-            action: "Check the service’s access requirements and rate limits before trying again.",
-            instructions: `A forbidden HTTP response alone does not prove invalid credentials, insufficient scopes, SSO restrictions, or a rate limit. ${instructions}`,
-          },
-          retryable: false,
-        };
-    }
-  },
+        case "unauthorized":
+          if (credentialsRenewed === true)
+            return {
+              title: "Access renewed; request not repeated",
+              description: `${service} rejected the credentials${target}${context}.${reported} Executor has renewed the account’s access, but did not repeat this call automatically.`,
+              recovery: {
+                action: "The renewed access is used from now on.",
+                instructions: `Executor renewed the account’s access but did not repeat this call. Renewal does not establish whether an earlier part of the call changed data. ${instructions}`,
+              },
+              retryable: false,
+            };
+          // The renewal's own error says what failed. Only a call that may write reports it, so
+          // its recovery is the one for such a call, never repeating it.
+          if (renewalFailure !== undefined)
+            return {
+              title: renewalFailure.title,
+              description: `${service} rejected the credentials${target}${context}.${reported} Renewing the account’s access failed: ${renewalFailure.description}`,
+              ...renewalRecovery(renewalFailure),
+              retryable: false,
+            };
+          return {
+            title: "Authentication failed",
+            description: `${service} rejected the credentials${target}${context}.${reported}`,
+            recovery: {
+              action:
+                "Check how the request authenticates. Update credentials or reconnect only if the evidence requires it.",
+              instructions: `The provider rejected authentication. This does not establish whether credentials are expired, revoked, missing, or sent incorrectly. ${instructions}`,
+            },
+            retryable: false,
+          };
+        case "forbidden":
+          return {
+            title: "Permission required",
+            description: `${service} reported insufficient permission${target}${context}.${reported}`,
+            recovery: {
+              action: "Check the account’s permissions and the service’s access requirements.",
+              instructions: `The provider explicitly reported insufficient permission. Do not invent required scopes or organization approval requirements. ${instructions}`,
+            },
+            retryable: false,
+          };
+        case "rate_limited":
+          return {
+            title: "Service rate limit reached",
+            description: `${service} is limiting requests${target}${context}.${reported}`,
+            recovery: {
+              action: "Wait for the service’s rate limit to reset before trying again.",
+              instructions: `The service reported a rate limit. Wait for its documented retry time before another read attempt. Avoid immediate repeated calls. ${instructions}`,
+            },
+            retryable: true,
+          };
+        case "rejected":
+          return {
+            title: "Service rejected the request",
+            description: `${service} refused the request${target}${context}.${reported === "" ? " We could not identify the cause from the available error details." : reported}`,
+            recovery: {
+              action: "Check the service’s access requirements and rate limits.",
+              instructions: `A forbidden HTTP response alone does not prove invalid credentials, insufficient scopes, SSO restrictions, or a rate limit. ${instructions}`,
+            },
+            retryable: false,
+          };
+      }
+    },
+  ),
 });
 /** Safe, decoded provider failure with product recovery guidance. */
 export type AppProviderFailed = typeof AppProviderFailed.Type;
@@ -777,12 +1014,19 @@ export const routerFailure = (
       })
     : evaluationFailure(identity, error);
 
-/** This evaluated app does not expose the named tool. */
+const toolNotFound = ({ tool }: { readonly tool: ToolName }): RefusalCopy => {
+  const description = `The app does not expose a tool named “${tool}”.`;
+  return { message: description, title: "Tool not found", description };
+};
+/**
+ * This evaluated app does not expose the named tool. With `mayHaveWritten`, the app's reply to a
+ * call that may write said so after the app's code received the call, as for every refusal below.
+ */
 export const ToolNotFound = ApiError.define({
   tag: "ToolNotFound",
   status: 404,
-  fields: { app: AppId, deployment: DeploymentId, tool: ToolName },
-  message: ({ tool }) => `The app does not expose a tool named “${tool}”.`,
+  fields: { app: AppId, deployment: DeploymentId, tool: ToolName, mayHaveWritten: MayHaveWritten },
+  message: refusalMessage(toolNotFound),
   recorded: () => "The app does not expose the requested tool",
 });
 export type ToolNotFound = typeof ToolNotFound.Type;
@@ -791,7 +1035,27 @@ export type ToolNotFound = typeof ToolNotFound.Type;
 export const ToolKind = Schema.Literals(["query", "mutation"]);
 export type ToolKind = typeof ToolKind.Type;
 
-/** The tool exists with the other kind. Nothing ran; call it again with `actual`. */
+const toolKindMismatch = ({
+  tool,
+  requested,
+  actual,
+}: {
+  readonly tool: ToolName;
+  readonly requested: ToolKind;
+  readonly actual: ToolKind;
+}): RefusalCopy => {
+  const description = `The tool “${tool}” is a ${actual}, but it was called as a ${requested}.`;
+  return {
+    message: `${description} Call it as a ${actual}.`,
+    title: "Tool kind changed",
+    description,
+  };
+};
+/**
+ * The tool exists with the other kind; a query's caller calls it again with `actual`. The app's
+ * framework reports this after evaluating the app, so the copy does not claim that nothing ran,
+ * and a call that may have written is not told to call again.
+ */
 export const ToolKindMismatch = ApiError.define({
   tag: "ToolKindMismatch",
   status: 409,
@@ -801,14 +1065,29 @@ export const ToolKindMismatch = ApiError.define({
     tool: ToolName,
     requested: ToolKind,
     actual: ToolKind,
+    mayHaveWritten: MayHaveWritten,
   },
-  message: ({ tool, requested, actual }) =>
-    `The tool “${tool}” is a ${actual}, but it was called as a ${requested}. Nothing ran; call it as a ${actual}.`,
-  recorded: ({ requested, actual }) =>
+  message: refusalMessage(toolKindMismatch),
+  recorded: ({ requested, actual }: { readonly requested: ToolKind; readonly actual: ToolKind }) =>
     `The tool is a ${actual}, but it was called as a ${requested}`,
 });
 export type ToolKindMismatch = typeof ToolKindMismatch.Type;
 
+/** How input problems read; supplied values are never included. */
+const inputProblems =
+  "Each problem names an input path and what that path expects: a type, the values the schema allows, an object's keys (? marks an optional key, ... marks other keys allowed), an unexpected key to remove, or the alternatives a union accepts. For a union, pick one alternative and set the key that tells them apart; the problems after it are for the closest alternative. Nest each field where the tool's input type from tools.search or tools.search.describe places it";
+const inputInvalid = ({ problems }: { readonly problems: ReadonlyArray<string> }): RefusalCopy => {
+  const description = `Input failed validation: ${problems.join("; ")}`.slice(0, 4096);
+  return {
+    message: description,
+    title: "Input failed validation",
+    description,
+    recovery: {
+      action: "Change the input to the shape each problem expects, then call the tool again.",
+      instructions: `${inputProblems}, then retry.`,
+    },
+  };
+};
 /**
  * The tool input did not match its declared schema. The app states its problems, which name the
  * caller's keys and paths and the schema's keys, values and patterns; only the caller reads them.
@@ -821,14 +1100,46 @@ export const InputInvalid = ApiError.define({
     deployment: DeploymentId,
     tool: ToolName,
     problems: Schema.Array(Schema.String),
+    mayHaveWritten: MayHaveWritten,
   },
-  message: ({ problems }) => `Input failed validation: ${problems.join("; ")}`.slice(0, 4096),
+  message: (fields) => refusalMessage(inputInvalid)(fields).slice(0, 4096),
   recorded: () => "The tool's input did not match its schema; the problems are not recorded",
 });
 export type InputInvalid = typeof InputInvalid.Type;
 
-/** A tool failed after starting; its external effects may already have occurred. */
-export const ToolCallFailed = ApiError.define({
+/**
+ * Statuses that report a temporary condition, so repeating the same request later may help. Other
+ * server errors, such as 501 Not Implemented or 505 HTTP Version Not Supported, do not. A declared
+ * error states no retry policy of its own, so its status decides.
+ */
+const temporaryStatus = (status: number) =>
+  status === 408 ||
+  status === 425 ||
+  status === 429 ||
+  status === 500 ||
+  status === 502 ||
+  status === 503 ||
+  status === 504;
+
+/**
+ * App storage failures a later attempt may not meet: a timeout, a failure to complete, or the
+ * cache being unavailable for the operation, such as when a concurrent load took over the lease to
+ * publish its value. A cache request it cannot accept (`invalid`) or one over its limits
+ * (`capacity`), and app data limits, fail the same way again.
+ */
+const temporaryStorage = ({ errorName, code }: AppFailure) =>
+  errorName === "CacheError" &&
+  (code === "timeout" || code === "storage" || code === "unavailable");
+
+/** The error name and code a failure reported, for copy. */
+const failureName = ({ errorName, code }: AppFailure) =>
+  `${errorName}${code === undefined ? "" : `, ${code}`}`;
+
+/**
+ * A tool call failed once it reached the app, or its result was lost; its external effects may
+ * already have occurred. Without `mayHaveWritten`, the call was a query, which only reads.
+ */
+export const ToolCallFailed = UserFacingError.define({
   tag: "ToolCallFailed",
   status: 502,
   fields: {
@@ -840,19 +1151,97 @@ export const ToolCallFailed = ApiError.define({
      * account secrets replaced.
      */
     reason: Schema.String,
+    /** The error the app's API declared and returned, with its own status and recovery. */
     response: Schema.optional(ApiErrorResponse),
     /** The app's own error, or the app data failure, that stopped the operation. */
     failure: Schema.optional(AppFailure),
     /** The app's MCP server refused or failed the tool call, such as with a JSON-RPC error. */
     mcp: Schema.optional(McpFailure),
+    mayHaveWritten: MayHaveWritten,
   },
-  message: ({ reason }) => reason,
-  recorded: ({ failure, mcp }) =>
+  recorded: ({ failure, mcp, response }) =>
     mcp !== undefined
       ? `The tool failed: ${recordedMcp(mcp)}`
       : failure !== undefined
         ? `The tool failed: ${recordedApp(failure)}`
-        : "The tool failed after starting",
+        : response !== undefined
+          ? "The tool failed after starting"
+          : "The tool failed without further detail",
+  presentation: callPresentation(({ reason, response, failure, mcp }) => {
+    if (mcp !== undefined) return mcpFailurePresentation(mcp);
+    // The API's own recovery, when it stated one, is shown as the API wrote it.
+    if (response !== undefined)
+      return {
+        title: "The app’s API returned an error",
+        description: response.message,
+        ...(response.recovery === undefined
+          ? {
+              recovery: {
+                action: "Read the API’s error to determine the next step.",
+                instructions: `An API the app calls returned an error its OpenAPI document declares (${response.code}, HTTP ${response.status}). Read its message to decide whether the input, the account's access or the API is at fault.${temporaryStatus(response.status) ? ` HTTP ${response.status} can be temporary: for a read, one later attempt may help.` : ""}`,
+              },
+            }
+          : { recovery: response.recovery, declared: true as const }),
+        retryable: temporaryStatus(response.status),
+      };
+    if (failure === undefined)
+      return {
+        title: "Tool failed",
+        description: `${reason.endsWith(".") ? reason : `${reason}.`} No further failure detail is available.`,
+        recovery: {
+          action:
+            "Try once more. If it fails again, inspect the available diagnostics or report the failure.",
+          instructions:
+            "No further failure detail is available, and this error does not establish whether the tool completed. For a read, one further attempt may help. If it fails again, inspect the available diagnostics or report the failure.",
+        },
+        retryable: true,
+      };
+    switch (failure.source) {
+      case "service":
+        return {
+          title: "The app’s service integration failed",
+          description: reason,
+          recovery: {
+            action: "Read the reported error and check the corresponding request or configuration.",
+            instructions: `The app’s service integration failed (${failureName(failure)}). The reported details do not establish whether the cause is the request, the service or Executor.${failure.errorName !== "OpenapiError" ? "" : failure.code === "invalid_definition" ? " The API's OpenAPI document describes this operation in a way Executor cannot use. Check the operation's definition in that document." : " The message names the API operation when it is known and, when a response arrived, its status, media type and length; the response body is not shown. Check the operation's parameters, the API's status, and whether its OpenAPI document declares this error."}`,
+          },
+          retryable: false,
+        };
+      case "storage":
+        return temporaryStorage(failure)
+          ? {
+              title: "App storage did not complete the operation",
+              description: reason,
+              recovery: {
+                action:
+                  "Retry once after a short wait. If it fails again, report that the app’s storage is failing.",
+                instructions: `The app's storage did not complete this operation (${failureName(failure)}), such as on a timeout, a temporary failure or a cache that was unavailable for it. For a read, a bounded retry may help. If the same failure repeats, the host may not provide the storage the app uses.`,
+              },
+              retryable: true,
+            }
+          : {
+              title: "App storage rejected the operation",
+              description: reason,
+              recovery: {
+                action: "Change the operation to stay within the storage rule or limit it names.",
+                instructions: `The app's storage refused this operation (${failureName(failure)}): it breaks a schema or limit rule, so the same operation is expected to fail again. Correct the operation, such as the app's query, mutation or cache use, before another attempt.`,
+              },
+              retryable: false,
+            };
+      case "app":
+        return {
+          title: "The app’s tool failed",
+          description: reason,
+          recovery: {
+            action:
+              "Read the error to determine whether input, app code, configuration or Executor needs attention.",
+            instructions:
+              "This error arose while running the app’s tool. Corrected input is a new call. For a read with an uncertain temporary cause, one further attempt may help.",
+          },
+          retryable: true,
+        };
+    }
+  }),
 });
 export type ToolCallFailed = typeof ToolCallFailed.Type;
 
@@ -879,8 +1268,8 @@ export const operationMcpFailure = (
 export const ToolBlocked = UserFacingError.define({
   tag: "ToolBlocked",
   status: 403,
-  fields: { app: AppId, deployment: DeploymentId, tool: ToolName },
-  presentation: ({ tool }) => ({
+  fields: { app: AppId, deployment: DeploymentId, tool: ToolName, mayHaveWritten: MayHaveWritten },
+  presentation: callPresentation(({ tool }) => ({
     title: "Blocked by the app’s approval policy",
     description: `The approval policy in the app’s code denied this call to “${tool}”.`,
     recovery: {
@@ -888,34 +1277,108 @@ export const ToolBlocked = UserFacingError.define({
         "Check what the app’s approval policy requires for this tool. If the call should be allowed, meet those requirements or, with the user’s agreement, change the policy and deploy it. Otherwise use a different tool.",
       instructions: `The approval policy that “${tool}” declares in the app’s code returned \`denied\` for this call. Do not retry the call unchanged. Tell the user which tool was blocked. Read the policy to see what it checks: its input, the app’s configuration, or the user’s access. If the call should be allowed and a requirement is unmet, meet it (for example, ask the user to enable the setting or grant the access) and call the tool again. Change the app’s source only when the policy itself is wrong and the user agrees: find the tool’s \`approval\` option, or the \`withApprovals\` policy over its router, return \`user-approval\` to ask the user or \`approved\` to run it, then deploy. Otherwise reach the goal with a different tool.`,
     },
-  }),
-  recorded: () => "The tool's approval policy blocked this call. The tool did not run.",
+  })),
+  recorded: () => "The tool's approval policy blocked this call.",
 });
 export type ToolBlocked = typeof ToolBlocked.Type;
 
-/** Adapter diagnostic for callers that cannot yet present a pending SDK approval request. */
+const toolApprovalRequired = ({ tool }: { readonly tool: ToolName }): RefusalCopy => ({
+  message: `“${tool}” needs approval before it runs, and this request cannot present an approval prompt.`,
+  title: "Approval required",
+  description: `“${tool}” needs approval, and this request cannot present an approval prompt.`,
+});
+/**
+ * Adapter diagnostic for callers that cannot yet present a pending SDK approval request
+ * (`approvalRequired`). The app's code asked for the approval, so for a call that may write the
+ * copy does not claim that the tool has not run.
+ */
 export const ToolApprovalRequired = ApiError.define({
   tag: "ToolApprovalRequired",
   status: 409,
-  fields: { app: AppId, deployment: DeploymentId, tool: ToolName },
-  // App code reports that approval is required, so this never claims the tool did not run.
-  message: ({ tool }) =>
-    `“${tool}” needs approval, and this request cannot present an approval prompt. Executor will not run the call from this request.`,
-  recorded: () =>
-    "The tool needs approval, and this request cannot present an approval prompt. Executor will not run the call from this request.",
+  fields: { app: AppId, deployment: DeploymentId, tool: ToolName, mayHaveWritten: MayHaveWritten },
+  message: refusalMessage(toolApprovalRequired),
+  recorded: () => "The tool needs approval, and this request cannot present an approval prompt.",
 });
 export type ToolApprovalRequired = typeof ToolApprovalRequired.Type;
 
-/** The tool's approval policy could not decide. The tool did not run and author failure details remain private. */
+const toolPolicyFailed = ({ tool }: { readonly tool: ToolName }): RefusalCopy => {
+  const description = `The approval policy of “${tool}” failed before deciding.`;
+  return { message: description, title: "Approval policy failed", description };
+};
+/**
+ * The tool's approval policy could not decide. The policy is the app's code, so the copy does not
+ * claim what ran; author failure details remain private.
+ */
 export const ToolPolicyFailed = ApiError.define({
   tag: "ToolPolicyFailed",
   status: 500,
-  fields: { app: AppId, deployment: DeploymentId, tool: ToolName },
-  message: ({ tool }) =>
-    `The approval policy of “${tool}” failed before deciding. The tool did not run.`,
-  recorded: () => "The tool's approval policy failed before deciding. The tool did not run.",
+  fields: { app: AppId, deployment: DeploymentId, tool: ToolName, mayHaveWritten: MayHaveWritten },
+  message: refusalMessage(toolPolicyFailed),
+  recorded: () => "The tool's approval policy failed before deciding.",
 });
 export type ToolPolicyFailed = typeof ToolPolicyFailed.Type;
+
+/**
+ * Every error a failed tool call reports to its caller once the call reached the app's code,
+ * including a failure of Executor's own storage after it. Each records `mayHaveWritten` for a call
+ * that may have written, and presents it through `callPresentation`.
+ */
+export const CallFailure = Schema.Union([
+  ToolCallFailed,
+  AppProviderFailed,
+  AppEvaluationFailed,
+  ToolElicitationFailed,
+  ToolNotFound,
+  ToolKindMismatch,
+  InputInvalid,
+  ToolBlocked,
+  ToolApprovalRequired,
+  ToolPolicyFailed,
+  StorageError,
+  CredentialsError,
+]);
+export type CallFailure = typeof CallFailure.Type;
+
+/** A product error's own presentation. */
+const presented = ({
+  title,
+  description,
+  recovery,
+  retryable,
+}: UserFacingError): ErrorPresentation => ({ title, description, recovery, retryable });
+
+/**
+ * A call failure as a surface that presents failures itself shows it, such as MCP or a dashboard:
+ * the error's own presentation, or a refusal's. Both are composed by `callPresentation`, so a call
+ * that may have written leads with Executor's instruction not to repeat it and no cause advises
+ * another call. A query's refusal without recovery advice has no presentation; its code names it.
+ */
+export const callFailurePresentation = (failure: CallFailure): ErrorPresentation | undefined =>
+  Match.value(failure).pipe(
+    Match.tagsExhaustive({
+      ToolNotFound: refusalPresentation(toolNotFound),
+      ToolKindMismatch: refusalPresentation(toolKindMismatch),
+      InputInvalid: refusalPresentation(inputInvalid),
+      ToolApprovalRequired: refusalPresentation(toolApprovalRequired),
+      ToolPolicyFailed: refusalPresentation(toolPolicyFailed),
+      ToolCallFailed: presented,
+      AppProviderFailed: presented,
+      AppEvaluationFailed: presented,
+      ToolElicitationFailed: presented,
+      ToolBlocked: presented,
+      StorageError: presented,
+      CredentialsError: presented,
+    }),
+  );
+
+/**
+ * The presentation of a failure whose call may have written, for a surface that otherwise shows
+ * the failure with its own fixed copy, such as a dashboard; undefined for any other error.
+ */
+export const mayHaveWrittenFailure = (error: unknown): ErrorPresentation | undefined =>
+  Schema.is(CallFailure)(error) && error.mayHaveWritten === true
+    ? callFailurePresentation(error)
+    : undefined;
 
 /** A saved account identity; credentials are always resolved again on resume. */
 export const InvocationAccount = Schema.Struct({
@@ -935,7 +1398,10 @@ export const ToolInvocation = Schema.Struct({
   owner: OwnerId,
   deployment: DeploymentId,
   tool: ToolName,
-  /** Approvals saved before calls named their kind carry none; resumption reads it from the catalog. */
+  /**
+   * The caller's kind. Without one (a call that named none, or saved before calls named one),
+   * resumption dispatches with the catalog's kind and treats the call as one that may write.
+   */
   kind: Schema.optionalKey(ToolKind),
   input: Json,
   accounts: Schema.Record(
@@ -950,7 +1416,10 @@ export const ToolCompleted = Schema.Struct({
   value: Json,
   toolError: Schema.optionalKey(Schema.Literal(true)),
 });
-/** Pending call plus the framework's MCP confirmation form. The SDK does not collect the response. */
+/**
+ * Pending call plus the MCP confirmation form the SDK builds from it, which shortens long arguments.
+ * The SDK does not collect the response.
+ */
 export const ToolPending = Schema.Struct({
   status: Schema.Literal("approval-required"),
   requestId: ApprovalRequestId,
@@ -961,19 +1430,99 @@ export const ToolPending = Schema.Struct({
 /** Public outcome of an initial call. */
 export const ToolCallResult = Schema.Union([ToolCompleted, ToolPending]);
 export type ToolCallResult = typeof ToolCallResult.Type;
+
+/**
+ * The failure a caller reports when it cannot present a pending call's approval prompt. The app's
+ * code asked for the approval after it received the call, so a call that may write (not a query)
+ * may already have made its change.
+ */
+export const approvalRequired = ({ invocation }: Pick<typeof ToolPending.Type, "invocation">) =>
+  new ToolApprovalRequired({
+    app: invocation.app,
+    deployment: invocation.deployment,
+    tool: invocation.tool,
+    ...(invocation.kind === "query" ? {} : { mayHaveWritten: true as const }),
+  });
+/** Every way a live call fails. A resumed call is the same call, so it fails the same ways. */
+const toolCallErrors = [
+  ...ProfileErrors,
+  StorageError,
+  CredentialsError,
+  AppNotFound,
+  AppNotDeployed,
+  DeploymentNotFound,
+  AppEvaluationFailed,
+  AppProviderFailed,
+  AccountNotFound,
+  AccountRequired,
+  AccountSelectionInvalid,
+  ToolNotFound,
+  ToolKindMismatch,
+  InputInvalid,
+  ToolCallFailed,
+  OAuthReconnectRequired,
+  OAuthRenewalFailed,
+  ToolBlocked,
+  ToolApprovalRequired,
+  ToolPolicyFailed,
+  ToolElicitationFailed,
+  RequestInvalid,
+] as const;
+/**
+ * What resuming an approved call failed with, exactly as the live call would report it. Some of
+ * these, such as an account that no longer resolves, fail before the tool's code is dispatched.
+ */
+export const ToolResumeFailure = Schema.Union(toolCallErrors);
+export type ToolResumeFailure = typeof ToolResumeFailure.Type;
 /** Only the consuming caller receives an execution result. Duplicates do not replay it. */
 export const ToolResumeResult = Schema.Union([
   ToolCompleted,
   Schema.Struct({ status: Schema.Literal("denied"), requestId: ApprovalRequestId }),
   Schema.Struct({ status: Schema.Literal("cancelled"), requestId: ApprovalRequestId }),
+  /**
+   * Executor did not resume the saved call: the request expired, or Executor read the app,
+   * deployment, profile or accounts and they differ from the reviewed call.
+   */
   Schema.Struct({
     status: Schema.Literal("failed"),
     requestId: ApprovalRequestId,
-    reason: Schema.Literals(["expired", "context-changed", "execution-failed"]),
+    reason: Schema.Literals(["expired", "context-changed"]),
+  }),
+  /** Resuming the approved call failed with the error a live call reports. */
+  Schema.Struct({
+    status: Schema.Literal("failed"),
+    requestId: ApprovalRequestId,
+    reason: Schema.Literal("execution-failed"),
+    error: ToolResumeFailure,
+    /**
+     * `unconfirmed`: Executor's own storage failed, with `error`, while it read the current app,
+     * deployment, profile or accounts to compare with the reviewed call, so it did not resume the
+     * call. Nothing shows that they changed. It is a field, not a reason: clients that predate it,
+     * such as dashboards still open during a deploy, reject an unknown reason but ignore a field.
+     */
+    context: Schema.optionalKey(Schema.Literal("unconfirmed")),
   }),
   Schema.Struct({ status: Schema.Literal("already-consumed"), requestId: ApprovalRequestId }),
 ]);
 export type ToolResumeResult = typeof ToolResumeResult.Type;
+/**
+ * A resume result as a client receives it. Servers always send a `ToolResumeResult`, but servers
+ * from releases before `error` was added send `execution-failed` without it. A client can meet one:
+ * an open dashboard tab outlives a rollback, and Cloud deploys its dashboard and API separately.
+ * So this also accepts that member with neither `error` nor `context`; a supplied one must decode
+ * as above.
+ */
+export const ToolResumeResultReceived = ToolResumeResult.mapMembers((members) => [
+  ...members,
+  Schema.Struct({
+    status: Schema.Literal("failed"),
+    requestId: ApprovalRequestId,
+    reason: Schema.Literal("execution-failed"),
+    error: Schema.optionalKey(Schema.Never),
+    context: Schema.optionalKey(Schema.Never),
+  }),
+]);
+export type ToolResumeResultReceived = typeof ToolResumeResultReceived.Type;
 /**
  * A pending request a host reads to show the person the call it would resume. The arguments are the
  * saved invocation's. The issuer is the host's own record; the host refuses requests it did not issue.
@@ -1122,30 +1671,7 @@ export const ToolsGroup = HttpApiGroup.make("tools")
     HttpApiEndpoint.post("call", "/v1/tools/call", {
       payload: ToolInputs.call,
       success: ToolCallResult,
-      error: [
-        ...ProfileErrors,
-        StorageError,
-        CredentialsError,
-        AppNotFound,
-        AppNotDeployed,
-        DeploymentNotFound,
-        AppEvaluationFailed,
-        AppProviderFailed,
-        AccountNotFound,
-        AccountRequired,
-        AccountSelectionInvalid,
-        ToolNotFound,
-        ToolKindMismatch,
-        InputInvalid,
-        ToolCallFailed,
-        OAuthReconnectRequired,
-        OAuthRenewalFailed,
-        ToolBlocked,
-        ToolApprovalRequired,
-        ToolPolicyFailed,
-        ToolElicitationFailed,
-        RequestInvalid,
-      ],
+      error: toolCallErrors,
     }),
   )
   .add(

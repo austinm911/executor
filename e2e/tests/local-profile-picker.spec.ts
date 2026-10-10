@@ -3,16 +3,17 @@ import { expect, layer } from "@effect/vitest";
 import { Effect, Redacted, Schema } from "effect";
 import { randomUUID } from "node:crypto";
 import type { Page } from "playwright";
-import { Api, body } from "../support/api.ts";
+import { Api, body, type Session } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { Target } from "../support/platform.ts";
 import { TestLive, withCase } from "../support/case.ts";
 import { Resource } from "../support/contracts.ts";
 import { nameConnectedAccount } from "../support/name-account.ts";
-import { Profile } from "../support/profiles.ts";
+import { connectAccountsThroughOtherApp, Profile } from "../support/profiles.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
 
+const mailProvider = `defineProvider({name:"Mail",auth:{key:secrets({label:"Key",fields:object({token:string()})})}})`;
 const slotRegion = (page: Page, slot: "service" | "mailboxes") =>
   page.getByRole("region", { name: `Mail (${slot})`, exact: true });
 const accountChoice = (page: Page, label: string) =>
@@ -30,6 +31,14 @@ layer(TestLive, { excludeTestServices: true })("Local profile picker", (it) => {
           target = yield* Target,
           session = yield* api.session();
         const headers = { authorization: `Bearer ${Redacted.value(target.apiKey)}` };
+        // Agent calls carry the API key and no browser origin.
+        const agent: Session = {
+          ...session,
+          send: (method, path, data, extra = {}) => {
+            const { origin: _origin, ...rest } = extra;
+            return session.send(method, path, data, { ...rest, ...headers });
+          },
+        };
         const deployed = yield* session.send(
           "POST",
           "/v1/apps/deploy",
@@ -39,7 +48,7 @@ layer(TestLive, { excludeTestServices: true })("Local profile picker", (it) => {
             files: [
               {
                 path: "index.ts",
-                content: `import {defineApp,defineProvider,secrets,query,object,string, router} from "apps";const service=defineProvider({name:"Mail",auth:{key:secrets({label:"Key",fields:object({token:string()})})}});export default defineApp({accounts:{service,mailboxes:service.many()}},async ctx=>({tools: router({
+                content: `import {defineApp,defineProvider,secrets,query,object,string, router} from "apps";const service=${mailProvider};export default defineApp({accounts:{service,mailboxes:service.many()}},async ctx=>({tools: router({
   identity:query({input:object({}),description:ctx.accounts.service.id},async()=>ctx.accounts.service.id),
 })}));`,
               },
@@ -68,22 +77,20 @@ layer(TestLive, { excludeTestServices: true })("Local profile picker", (it) => {
               yield* session.send("DELETE", `/v1/accounts/${account}`, undefined, headers);
           }).pipe(Effect.orDie),
         );
-        for (const label of ["Personal mail", "Spare mail"]) {
-          const response = yield* session.send(
-            "POST",
-            "/v1/accounts",
-            {
-              owner: "local",
-              provider: app.requirements.accounts.service.provider,
-              method: "key",
+        // Saved accounts, with no profile of this app yet.
+        for (const account of yield* connectAccountsThroughOtherApp(
+          agent,
+          {
+            provider: mailProvider,
+            method: "key",
+            accounts: ["Personal mail", "Spare mail"].map((label) => ({
               label,
               fields: { token: "synthetic" },
-            },
-            headers,
-          );
-          expect(response.status).toBe(200);
-          accounts.push((yield* body(Resource, response)).id);
-        }
+            })),
+          },
+          headers,
+        ))
+          accounts.push(account.id);
         const [personal, spare] = accounts;
         if (!personal || !spare) return yield* Effect.die("Missing accounts");
         const saved = (profile: string) =>

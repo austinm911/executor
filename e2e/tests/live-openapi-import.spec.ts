@@ -4,6 +4,7 @@ import { body } from "../support/api.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import {
   clientCredentialsScheme,
+  credentialEchoUpstream,
   deployPublicApp,
   invalidSchemaDocument,
   jsonLines,
@@ -53,6 +54,9 @@ const EvaluationFailed = Schema.Struct({
     message: Schema.String,
   }),
 });
+/** How every message about left-out operations ends, unless each one streams events. */
+const customTool =
+  'To call a left-out operation anyway, write a custom tool for it in this app with the same account: see "Custom tools beside generated ones" in the app-authoring skill\'s integrations.md.';
 const Recorded = Schema.Struct({ method: Schema.String, url: Schema.String, body: Schema.String });
 
 /** Definitions the importer cannot fully use, each mounted under its own key. */
@@ -170,7 +174,209 @@ export default defineApp({ accounts: {} }, async ({ cache, fetch, signal }) => (
 }));
 `;
 
+/**
+ * Operations that accept one of several credentials, where some alternatives name a scheme the
+ * app's securitySchemes leaves out or the definition never declares. Each router's account fills
+ * one alternative.
+ */
+const alternatives = (origin: string) => {
+  const json = { "application/json": { schema: { type: "object" } } };
+  const get = (operationId: string, security: readonly Record<string, string[]>[]) => ({
+    get: { operationId, security, responses: { "200": { description: "OK", content: json } } },
+  });
+  const oauth2 = {
+    type: "oauth2",
+    flows: {
+      authorizationCode: {
+        authorizationUrl: `${origin}/oauth/authorize`,
+        tokenUrl: `${origin}/oauth/token`,
+        scopes: { read: "Read" },
+      },
+    },
+  };
+  const definition = (schemes: Record<string, unknown>, paths: Record<string, unknown>) => ({
+    openapi: "3.1.0",
+    info: { title: "Alternatives", version: "1" },
+    servers: [{ url: origin }],
+    components: { securitySchemes: schemes },
+    paths,
+  });
+  const botToken = { type: "apiKey", in: "header", name: "Authorization" };
+  const queryKey = { type: "apiKey", in: "query", name: "key" };
+  const basicAuth = { type: "http", scheme: "basic" };
+  const options = {
+    // The definition declares OAuth, but the app declares only the schemes its account fills.
+    bot: {
+      source: {
+        document: definition(
+          { botToken, queryKey, oauth: oauth2 },
+          {
+            "/channels": get("listChannels", [{ botToken: [] }, { oauth: ["read"] }]),
+            // The first alternative pairs the query key with a scheme declared nowhere.
+            "/guilds": get("listGuilds", [{ queryKey: [], session: [] }, { botToken: [] }]),
+          },
+        ),
+      },
+      securitySchemes: { botToken, queryKey },
+      methods: {
+        bot: [
+          { scheme: "botToken", field: "token", part: "value", prefix: "Bot " },
+          { scheme: "queryKey", field: "key", part: "value", prefix: "" },
+        ],
+      },
+      oauth: [],
+    },
+    basic: {
+      source: {
+        document: definition(
+          { basicAuth, oauth: oauth2 },
+          { "/items": get("listItems", [{ basicAuth: [] }, { oauth: [] }]) },
+        ),
+      },
+      securitySchemes: { basicAuth },
+      methods: {
+        basic: [
+          { scheme: "basicAuth", field: "username", part: "username", prefix: "" },
+          { scheme: "basicAuth", field: "password", part: "password", prefix: "" },
+        ],
+      },
+      oauth: [],
+    },
+    // The definition itself names a scheme it never declares.
+    posts: {
+      source: {
+        document: definition(
+          { userOauth: oauth2 },
+          {
+            "/posts": get("listPosts", [{ userOauth: ["read"] }, { userToken: [] }]),
+            "/admin": get("getAdmin", [{ userToken: [] }, { adminKey: [], userOauth: [] }]),
+          },
+        ),
+      },
+      securitySchemes: { userOauth: oauth2 },
+      methods: {},
+      oauth: ["userOauth"],
+    },
+  };
+  const accounts = {
+    bot: { method: "bot", fields: { token: "synthetic-bot", key: "synthetic-key" } },
+    basic: { method: "basic", fields: { username: "synthetic-user", password: "synthetic-pass" } },
+    posts: { method: "userOauth", fields: { access_token: "synthetic-access" } },
+  };
+  return `import { defineApp, object, query, router } from "apps";
+import { liveOpenapiRouter, openapiToolNames } from "apps/openapi";
+const options = ${JSON.stringify(options)};
+const accounts = ${JSON.stringify(accounts)};
+const allowedOrigin = ${JSON.stringify(origin)};
+export default defineApp({ accounts: {} }, async ({ cache, fetch, signal }) => ({
+  tools: router({
+    bot: liveOpenapiRouter({ ...options.bot, allowedOrigin, cache, fetch, signal, account: accounts.bot }),
+    basic: liveOpenapiRouter({ ...options.basic, allowedOrigin, cache, fetch, signal, account: accounts.basic }),
+    posts: liveOpenapiRouter({ ...options.posts, allowedOrigin, cache, fetch, signal, account: accounts.posts }),
+    names: query({ description: "Tool names of each definition", input: object({}) }, async () => {
+      const listings: Record<string, unknown> = {};
+      for (const [name, settings] of Object.entries(options))
+        listings[name] = await openapiToolNames({ ...settings, allowedOrigin, fetch, signal });
+      return listings;
+    }),
+  }),
+}));
+`;
+};
+
 layer(HostedLive, { excludeTestServices: true })("Live OpenAPI import", (it) => {
+  it.effect(scenarios.liveOpenapiAlternatives.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const upstream = yield* credentialEchoUpstream;
+        const app = yield* deployPublicApp(alternatives(upstream.origin));
+
+        // Before an account connects, each operation with a met alternative lists the method that
+        // meets it; the one whose every alternative names an undeclared scheme is left out.
+        const listing = yield* app.call("names", "query", {});
+        expect(listing.status, JSON.stringify(listing.body)).toBe(200);
+        const names = yield* body(Schema.Record(Schema.String, OpenapiToolNames), listing);
+        const tools = (name: string) =>
+          names[name]?.tools.map((tool) => [tool.name, tool.methods, tool.public]);
+        expect(tools("bot")).toEqual([
+          ["channels.listChannels", ["bot"], false],
+          ["guilds.listGuilds", ["bot"], false],
+        ]);
+        expect(tools("basic")).toEqual([["items.listItems", ["basic"], false]]);
+        expect(tools("posts")).toEqual([["posts.listPosts", ["userOauth"], false]]);
+        const reason =
+          'Every security requirement names a scheme securitySchemes does not declare: "userToken", "adminKey". Declare and fill every scheme in one complete alternative (securitySchemes plus methods or oauth).';
+        expect(names.bot?.skipped).toEqual([]);
+        expect(names.basic?.skipped).toEqual([]);
+        expect(names.posts?.skipped).toEqual([
+          { name: "admin.getAdmin", method: "GET", path: "/admin", code: "auth_method", reason },
+        ]);
+
+        const listed = yield* app.tools;
+        expect(listed.status, JSON.stringify(listed.body)).toBe(200);
+        const catalog = yield* body(Catalog, listed);
+        expect(catalog.routers.filter((router) => router.error !== undefined)).toEqual([]);
+        expect(
+          catalog.items
+            .map((tool) => tool.name)
+            .filter((name) => name !== "names")
+            .sort(),
+        ).toEqual([
+          "basic.items.listItems",
+          "bot.channels.listChannels",
+          "bot.guilds.listGuilds",
+          "posts.posts.listPosts",
+        ]);
+
+        // Each call carries only the met alternative's credentials: the bot token, never the
+        // query key paired with an undeclared scheme.
+        const Echo = Schema.Struct({
+          method: Schema.String,
+          url: Schema.String,
+          authorization: Schema.NullOr(Schema.String),
+        });
+        const call = (tool: string) =>
+          app.call(tool, "query", {}).pipe(
+            Effect.tap((response) =>
+              Effect.sync(() => expect(response.status, JSON.stringify(response.body)).toBe(200)),
+            ),
+            Effect.flatMap((response) => body(Echo, response)),
+          );
+        expect(yield* call("bot.channels.listChannels")).toEqual({
+          method: "GET",
+          url: "/channels",
+          authorization: "Bot synthetic-bot",
+        });
+        expect(yield* call("bot.guilds.listGuilds")).toEqual({
+          method: "GET",
+          url: "/guilds",
+          authorization: "Bot synthetic-bot",
+        });
+        expect(yield* call("basic.items.listItems")).toEqual({
+          method: "GET",
+          url: "/items",
+          authorization: `Basic ${Buffer.from("synthetic-user:synthetic-pass").toString("base64")}`,
+        });
+        expect(yield* call("posts.posts.listPosts")).toEqual({
+          method: "GET",
+          url: "/posts",
+          authorization: "Bearer synthetic-access",
+        });
+
+        // Calling the left-out operation explains why, without sending a request.
+        const admin = yield* app.call("posts.admin.getAdmin", "query", {});
+        expect(admin.status, JSON.stringify(admin.body)).toBe(502);
+        expect((yield* body(EvaluationFailed, admin)).failure).toEqual({
+          source: "app",
+          errorName: "OpenapiCompileError",
+          code: "auth_method",
+          message: `${reason} Left out: GET /admin. ${customTool}`,
+        });
+      }),
+    ),
+  );
+
   it.effect(scenarios.liveOpenapiDiagnostics.title, (context) =>
     withHostedCase(
       context,
@@ -208,7 +414,7 @@ layer(HostedLive, { excludeTestServices: true })("Live OpenAPI import", (it) => 
           source: "app",
           errorName: "OpenapiCompileError",
           code: "schema_keyword",
-          message: `The schema at ${pointer} is invalid: "items" must be a schema, not an array, so the reference inside it cannot be resolved. Left out: GET /teams/{team}.`,
+          message: `The schema at ${pointer} is invalid: "items" must be a schema, not an array, so the reference inside it cannot be resolved. Left out: GET /teams/{team}. ${customTool}`,
         };
         const read = yield* app.tool("teams.teams.getTeam");
         expect(read.status, JSON.stringify(read.body)).toBe(502);
@@ -239,6 +445,8 @@ layer(HostedLive, { excludeTestServices: true })("Live OpenAPI import", (it) => 
         expect(failure("jobs")?.message).toContain(
           "GET /jobs (auth_method: Executor cannot authenticate with any of its security requirements: client (oauth2 clientCredentials)); GET /jobs/events (event_stream: It responds with text/event-stream",
         );
+        // It still offers a custom tool, for the operation that needs other authentication.
+        expect(failure("jobs")?.message?.endsWith(customTool)).toBe(true);
       }),
     ),
   );

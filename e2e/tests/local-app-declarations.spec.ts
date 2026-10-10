@@ -8,8 +8,7 @@ import { randomUUID } from "node:crypto";
 import { Api, body, type Session } from "../support/api.ts";
 import { Target } from "../support/platform.ts";
 import { TestLive, withCase } from "../support/case.ts";
-import { Resource } from "../support/contracts.ts";
-import { createProfile, selectProfileAccounts } from "../support/profiles.ts";
+import { connectLocalAccount, createProfile } from "../support/profiles.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
 
@@ -75,19 +74,19 @@ layer(TestLive, { excludeTestServices: true })("Local app declarations", (it) =>
           resources.apps.push(app.id);
           const path = `/v1/apps/${app.id}`;
           const profile = yield* createProfile(agent, path, { owner, subject: "local" });
-          const created = yield* api.request(agent, "POST", "/v1/accounts", {
-            owner: accountOwner,
-            provider: app.requirements.accounts.service.provider,
-            method: "key",
-            label: "Declaration clock",
-            fields: { token: "alpha" },
-          });
-          expect(created.status, JSON.stringify(created.body)).toBe(200);
-          const account = (yield* body(Resource, created)).id;
+          const connect = (token: string, account?: string) =>
+            connectLocalAccount(agent, {
+              owner: accountOwner,
+              app: app.id,
+              profile: profile.id,
+              requirement: "service",
+              method: "key",
+              label: "Declaration clock",
+              fields: { token },
+              ...(account === undefined ? {} : { account }),
+            });
+          const account = (yield* connect("alpha")).id;
           resources.accounts.push(account);
-          expect(
-            (yield* selectProfileAccounts(agent, path, profile.id, { service: account })).status,
-          ).toBe(200);
           const read = Effect.gen(function* () {
             const response = yield* api.request(
               agent,
@@ -105,12 +104,8 @@ layer(TestLive, { excludeTestServices: true })("Local app declarations", (it) =>
           expect(first).toMatch(/^first_alpha_\d+$/);
           expect(yield* read).toBe(first);
 
-          // A replaced credential and a new deployment are new evaluation inputs.
-          expect(
-            (yield* api.request(agent, "PUT", `/v1/accounts/${account}/credentials`, {
-              fields: { token: "beta" },
-            })).status,
-          ).toBe(200);
+          // A reconnected credential and a new deployment are new evaluation inputs.
+          expect((yield* connect("beta", account)).id).toBe(account);
           const reconnected = yield* read;
           expect(reconnected).toMatch(/^first_beta_\d+$/);
           expect(yield* read).toBe(reconnected);

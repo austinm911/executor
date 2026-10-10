@@ -1,5 +1,5 @@
 /** Pending tool calls are encrypted; consumption clears their payload before external work. */
-import type { ApprovalElicitation, ApprovalResponse } from "apps/contracts";
+import { approvalElicitation, type ApprovalResponse } from "apps/contracts";
 import { Clock, type Crypto, Effect, Redacted, Schema } from "effect";
 import {
   defaultToolApprovalLimits,
@@ -99,10 +99,13 @@ export function makeToolApprovals(
           ...(payload.issuer === undefined ? {} : { issuer: payload.issuer }),
         };
       }),
+    /**
+     * Save a call for review. Its prompt is built here from the saved invocation, never taken from
+     * the app, so it describes the exact call approval runs, as every later review of it does.
+     */
     save: (
       invocation: ToolInvocation,
       originalInput: Json,
-      elicitation: ApprovalElicitation,
       issuer: ToolApprovalIssuer | undefined,
     ) =>
       Effect.gen(function* () {
@@ -136,7 +139,7 @@ export function makeToolApprovals(
           status: "approval-required" as const,
           requestId: id,
           invocation,
-          elicitation,
+          elicitation: approvalElicitation(invocation.tool, invocation.input),
           expiresAt: expiresAt.getTime(),
         };
       }),

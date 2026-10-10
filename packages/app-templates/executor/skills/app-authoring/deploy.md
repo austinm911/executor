@@ -23,8 +23,9 @@ Read these docs with
 Commands target the local server at `http://127.0.0.1:4312` by default. It
 reads the local API key from `EXECUTOR_API_KEY`. If that variable is unset, ask
 the user to set it; do not search files for it. For hosted Executor, run
-`executor apps login --host https://api.executor.sh` once. It signs in through
-the browser. Then pass the same `--host` to every command.
+`executor apps login --host https://api.executor.sh` once. It prints a link and
+a code and waits; ask the user to open the link and approve the code. Then pass
+the same `--host` to every command.
 
 A new app is a directory with `index.ts` and a `package.json` that pins the
 exact `apps` version the host runs. `executor apps framework` prints that
@@ -65,11 +66,18 @@ Each iteration saves the directory as a commit and deploys it:
 
 ```sh
 executor apps commit --app <app-id> --files ./hello \
-  --expected <last-commit> --message "Add search" | jq -r .revision.commit
+  --expected <last-commit> --message "Add search" > /tmp/commit.json
+jq .removed /tmp/commit.json             # { count, paths }: files this save deleted
+jq -r .revision.commit /tmp/commit.json
 executor apps deploy --app <app-id> --commit <new-commit>
 ```
 
 The commit prints the new revision; its `commit` is the next `--expected`.
+`removed` gives how many files the save deleted and at most 100 of their paths. If it
+names a file you meant to keep, it is still in the `--expected` commit
+(`git show <last-commit>:<path>` in a clone): restore it and commit again before
+deploying. A path cannot be both a file and a folder (`a` and `a/b`); such a
+save fails with `SourcePathConflict` and saves nothing.
 `--expected` is the commit your edits are based on. If someone else saved in
 between, the commit is rejected. Read the source again and reconcile before
 retrying. A commit alone does not change the running app.
@@ -364,13 +372,21 @@ const saved = await executor.appManagement.commit({
   path,
   body: { expected: source.revision.commit, files, message: "Update app" },
 });
+if (saved.removed.count > 0) {
+  throw new Error(
+    `The save removed ${saved.removed.count} files: ${saved.removed.paths.join(", ")}`,
+  );
+}
 return await executor.appManagement.deploy({
   path,
   body: { commit: saved.revision.commit },
 });
 ```
 
-Commit sends the complete file list; omitted files are deleted. A stale
+Commit sends the complete file list; omitted files are deleted. The result's
+`removed` has their `count` and at most 100 of their `paths`; check it before
+deploying, as above. A deleted file is still in `source.files`: add it back and
+commit against `saved.revision.commit`. A stale
 `expected` returns `SourceError` with `reason: "conflict"`. Read working source
 again and reconcile the edits before retrying. Deployment returns `{ app,
 deployment }`, preserves the app ID and data, and never updates the Git branch.

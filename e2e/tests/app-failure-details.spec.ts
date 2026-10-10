@@ -12,6 +12,7 @@ import { frameworkSession } from "../support/framework.ts";
 import { McpOAuth } from "../support/mcp-oauth.ts";
 import { McpClient } from "../support/mcp-client.ts";
 import { appsManifest } from "../support/apps-release.ts";
+import { readAdvice, unknownOutcomeRecovery } from "../support/write-outcome.ts";
 
 const BuildFailed = Schema.Struct({
   _tag: Schema.Literal("DeploymentBuildFailed"),
@@ -47,6 +48,7 @@ const ExecutionFailed = Schema.Struct({
         recovery: Schema.optional(
           Schema.Struct({ action: Schema.String, instructions: Schema.String }),
         ),
+        retryable: Schema.Boolean,
       }),
     }),
   }),
@@ -58,11 +60,16 @@ const appMarker = "conversation.id is required";
 const operationApp = [
   {
     path: "index.ts",
-    content: `import { defineApp, string, query, mutation, object, router } from "apps";
+    content: `import { CacheError, defineApp, string, query, mutation, object, router } from "apps";
 class ConversationMissing extends Error { override name = "ConversationMissing"; }
 export default defineApp({ accounts: {} }, {
   tools: router({
     fail: query({ input: object({}) }, async () => { throw new ConversationMissing(${JSON.stringify(appMarker)}); }),
+    cacheUnavailable: query({ input: object({}) }, async () => { throw new CacheError({ reason: "unavailable" }); }),
+    cacheOverLimit: query({ input: object({}) }, async (ctx) => {
+      await ctx.cache.write([{ key: "x".repeat(9000), value: true }], "1 minute");
+      return true;
+    }),
     failWrite: mutation({ input: object({}) }, async (ctx) =>
       ctx.sql.transaction((tx) => {
         tx.exec("INSERT INTO items (label) VALUES ('rolled back')");
@@ -285,6 +292,31 @@ export default defineApp({ accounts: {} }, {});`,
         const mutation = yield* body(ToolFailed, yield* call("failWrite", "mutation"));
         expect(mutation.failure).toMatchObject({ source: "app", errorName: "TypeError" });
 
+        // A cache that was unavailable for the operation, as when another load took over its
+        // lease, is temporary; a request over the cache's limits fails the same way again.
+        const unavailable = yield* call("cacheUnavailable", "query");
+        expect(unavailable.body).toMatchObject({
+          _tag: "ToolCallFailed",
+          failure: {
+            source: "storage",
+            errorName: "CacheError",
+            code: "unavailable",
+            message: "The app cache was not available for this operation.",
+          },
+          recovery: {
+            action:
+              "Retry once after a short wait. If it fails again, report that the app’s storage is failing.",
+          },
+        });
+        const overLimit = yield* call("cacheOverLimit", "query");
+        expect(overLimit.body).toMatchObject({
+          _tag: "ToolCallFailed",
+          failure: { source: "storage", errorName: "CacheError", code: "capacity" },
+          recovery: {
+            action: "Change the operation to stay within the storage rule or limit it names.",
+          },
+        });
+
         // MCP callers receive the same message with recovery guidance.
         const { client } = yield* frameworkSession;
         const executed = yield* client.use("Call a failing app query", (client, signal) =>
@@ -303,12 +335,74 @@ export default defineApp({ accounts: {} }, {});`,
         const failure = (yield* Schema.decodeUnknownEffect(ExecutionFailed)(
           executed.structuredContent,
         )).execution.error;
+        // Executor cannot tell whether the app's error is temporary, so a read may be tried once more.
         expect(failure.response).toMatchObject({
           code: "ToolCallFailed",
           message: `The app threw ConversationMissing: ${appMarker}`,
-          recovery: { action: "Fix the input or the app code that threw this error, then retry." },
+          recovery: {
+            action:
+              "Read the error to determine whether input, app code, configuration or Executor needs attention.",
+            instructions:
+              "This error arose while running the app’s tool. Corrected input is a new call. For a read with an uncertain temporary cause, one further attempt may help.",
+          },
+          retryable: true,
         });
         expect(failure.message).toContain(appMarker);
+        expect(failure.message).toMatch(/ Retryable \(unchanged call\): yes\.$/);
+        const cacheRetryable = (tool: string) =>
+          client
+            .use(`Call the app query ${tool}`, (client, signal) =>
+              client.callTool(
+                {
+                  name: "execute",
+                  arguments: {
+                    code: `return await tools[${JSON.stringify(app.slug)}].${tool}({});`,
+                  },
+                },
+                undefined,
+                { signal },
+              ),
+            )
+            .pipe(
+              Effect.flatMap((executed) =>
+                Schema.decodeUnknownEffect(ExecutionFailed)(executed.structuredContent),
+              ),
+              Effect.map(({ execution }) => execution.error.response.retryable),
+            );
+        expect(yield* cacheRetryable("cacheUnavailable")).toBe(true);
+        expect(yield* cacheRetryable("cacheOverLimit")).toBe(false);
+
+        // A mutation's error may follow changes it made outside app data, so the agent is told
+        // not to repeat it automatically; the cause's advice for a read follows only as a quote.
+        const wrote = yield* client.use("Call a failing app mutation", (client, signal) =>
+          client.callTool(
+            {
+              name: "execute",
+              arguments: {
+                code: `return await tools[${JSON.stringify(app.slug)}].failWrite({});`,
+              },
+            },
+            undefined,
+            { signal },
+          ),
+        );
+        yield* evidence.json("mcp-mutation-failure.json", wrote.structuredContent);
+        const written = (yield* Schema.decodeUnknownEffect(ExecutionFailed)(
+          wrote.structuredContent,
+        )).execution.error;
+        expect(written.response).toMatchObject({
+          code: "ToolCallFailed",
+          message: `The app threw TypeError: ${appMarker}`,
+          retryable: false,
+        });
+        expect(written.response.recovery).toEqual(
+          unknownOutcomeRecovery(
+            readAdvice(
+              "Read the error to determine whether input, app code, configuration or Executor needs attention. This error arose while running the app’s tool. Corrected input is a new call. For a read with an uncertain temporary cause, one further attempt may help.",
+            ),
+          ),
+        );
+        expect(written.message).toMatch(/ Retryable \(unchanged call\): no\.$/);
       }).pipe(Effect.provide(Layer.mergeAll(McpOAuth.layer, McpClient.layer))),
     ),
   );

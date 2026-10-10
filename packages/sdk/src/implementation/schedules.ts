@@ -522,7 +522,10 @@ export const makeSchedules = (
       case "already-consumed":
         return finish(run, "interrupted", "AlreadyConsumed");
       case "failed":
-        return finish(run, result.reason === "expired" ? "expired" : "failed", result.reason);
+        // A resumed call that failed records its own error, as a live call's failure does.
+        return result.reason === "execution-failed"
+          ? finish(run, "failed", diagnostic(result.error))
+          : finish(run, result.reason === "expired" ? "expired" : "failed", result.reason);
     }
   };
   const activeProfiles = query(() =>

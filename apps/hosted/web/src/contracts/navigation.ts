@@ -8,7 +8,7 @@ export const ConnectionSearch = Schema.Struct({
   client: Schema.optionalKey(Schema.Literal("change")),
 });
 
-/** Direct links and refreshes retain a connection dialog on its app or account page. */
+/** Direct links and refreshes retain a connection dialog on its app page. */
 export function parseConnectionSearch(search: Record<string, unknown>): {
   readonly connection?: AccountConnectionId | undefined;
   readonly client?: "change" | undefined;
@@ -24,13 +24,10 @@ export function parseConnectionSearch(search: Record<string, unknown>): {
 }
 
 /** The account list marks a linked account, which has no page of its own. */
-export function parseAccountsSearch(search: Record<string, unknown>): ReturnType<
-  typeof parseConnectionSearch
-> & {
+export function parseAccountsSearch(search: Record<string, unknown>): {
   readonly account?: AccountId | undefined;
 } {
   return {
-    ...parseConnectionSearch(search),
     account: Option.getOrUndefined(Schema.decodeUnknownOption(AccountId)(search.account)),
   };
 }
@@ -74,6 +71,7 @@ export function hostedPageTitle(
   if (pathname === "/login") return "Sign in";
   if (pathname === "/invite") return "Invitation";
   if (pathname === "/mcp/authorize") return "Authorize client";
+  if (pathname === "/device") return "Connect a device";
   if (pathname === "/oauth/callback") return "Connecting account";
   const [root, section, page, item, action] = pathname.split("/").filter(Boolean);
   if (root === "account")
@@ -97,11 +95,9 @@ export function hostedPageTitle(
       ? action === "custom"
         ? "Add custom app"
         : "Add app"
-      : action === "setup"
-        ? "Choose accounts"
-        : item
-          ? "App"
-          : "Apps";
+      : item
+        ? "App"
+        : "Apps";
   if (page === "accounts") return "Accounts";
   return "Dashboard";
 }

@@ -249,8 +249,8 @@ export const HostedOAuthCallback = Schema.Struct({
   /** Dashboard state is keyed by the organization's route reference, its slug. */
   organizationSlug: OrganizationSlug,
   connection: AccountConnectionId,
-  app: Schema.NullOr(AppId),
-  profile: Schema.optional(ProfileId),
+  app: AppId,
+  profile: ProfileId,
   redirectUri: HttpUrl,
   reconnect: Schema.Boolean,
 });

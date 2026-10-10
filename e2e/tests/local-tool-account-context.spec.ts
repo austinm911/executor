@@ -1,11 +1,10 @@
-import { createProfile, selectProfileAccounts } from "../support/profiles.ts";
+import { connectLocalAccount, createProfile, selectProfileAccounts } from "../support/profiles.ts";
 import { expect, layer } from "@effect/vitest";
 import { Effect, Redacted, Schema } from "effect";
 import { randomUUID } from "node:crypto";
 import { Api, body, type Session } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { TestLive, withCase } from "../support/case.ts";
-import { Resource } from "../support/contracts.ts";
 import { Target } from "../support/platform.ts";
 import { accountToolSource, checkToolAccountContext } from "../support/tool-account-context.ts";
 import { scenarios } from "../test-plan.ts";
@@ -64,22 +63,21 @@ layer(TestLive, { excludeTestServices: true })("Local tool account context", (it
               yield* session.send("DELETE", `/v1/accounts/${account}`, undefined, headers);
           }).pipe(Effect.orDie),
         );
+        // Both accounts connect for the profile's many-account slot; the check then selects each.
         const add = (label: string, token: string) =>
           Effect.gen(function* () {
-            const response = yield* session.send(
-              "POST",
-              "/v1/accounts",
+            const account = yield* connectLocalAccount(
+              agent,
               {
-                owner: "local",
-                provider: app.requirements.accounts.workspaces.provider,
+                app: app.id,
+                profile: profile.id,
+                requirement: "workspaces",
                 method: "key",
                 label,
                 fields: { token },
               },
               headers,
             );
-            expect(response.status).toBe(200);
-            const account = yield* body(Resource, response);
             accounts.push(account.id);
             return account.id;
           });

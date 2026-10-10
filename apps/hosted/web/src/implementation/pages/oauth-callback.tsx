@@ -152,18 +152,11 @@ export function OAuthCallbackPage() {
       sessionStorage.removeItem("executor:hosted:oauth");
       // Reconnects keep their name; a new account is named on the page that follows.
       if (!reconnect) registry.set(accountToNameAtom, { organization, account: result.value.id });
-      if (app !== null) {
-        await navigate({
-          to: "/org/$organizationSlug/apps/$appId",
-          params: { organizationSlug, appId: app },
-          search: { view: "accounts", profile },
-        });
-      } else
-        await navigate({
-          to: "/org/$organizationSlug/accounts",
-          params: { organizationSlug },
-          search: { account: result.value.id },
-        });
+      await navigate({
+        to: "/org/$organizationSlug/apps/$appId",
+        params: { organizationSlug, appId: app },
+        search: { view: "accounts", profile },
+      });
     })();
   }, [registry, navigate]);
   return (
@@ -174,10 +167,7 @@ export function OAuthCallbackPage() {
           ? state.message
           : Option.match(pending, {
               onNone: () => "Finishing sign-in…",
-              onSome: (context) =>
-                context.app !== null
-                  ? "Finishing sign-in. You’ll return to the app automatically."
-                  : "Finishing sign-in. You’ll return to your accounts automatically.",
+              onSome: () => "Finishing sign-in. You’ll return to the app automatically.",
             })
       }
     >
@@ -211,13 +201,11 @@ function OAuthRecoveryActions({
   const context = pending.value;
   // Entered clients are saved only after a successful sign-in, so a retry reopens their fields.
   const retry =
-    recovery === "restart" ||
-    recovery === "client" ||
-    (recovery === "cancelled" && context.app === null)
+    recovery === "restart" || recovery === "client"
       ? {
           label: recovery === "client" ? "Update client details" : "Try again",
           search:
-            recovery === "client" || (recovery !== "cancelled" && context.manualClient)
+            recovery === "client" || context.manualClient === true
               ? { client: "change" as const }
               : {},
         }
@@ -249,26 +237,15 @@ function OAuthRecoveryActions({
           </Link>
         </Button>
       )}
-      {context.app !== null ? (
-        <Button variant={primary ? "default" : "outline"} asChild>
-          <Link
-            to="/org/$organizationSlug/apps/$appId"
-            params={{ organizationSlug: context.organizationSlug, appId: context.app }}
-            search={{ view: "accounts", profile: context.profile }}
-          >
-            Back to app
-          </Link>
-        </Button>
-      ) : retry === undefined ? (
-        <Button asChild variant={primary ? "default" : "outline"}>
-          <Link
-            to="/org/$organizationSlug/accounts"
-            params={{ organizationSlug: context.organizationSlug }}
-          >
-            Open Accounts
-          </Link>
-        </Button>
-      ) : null}
+      <Button variant={primary ? "default" : "outline"} asChild>
+        <Link
+          to="/org/$organizationSlug/apps/$appId"
+          params={{ organizationSlug: context.organizationSlug, appId: context.app }}
+          search={{ view: "accounts", profile: context.profile }}
+        >
+          Back to app
+        </Link>
+      </Button>
     </>
   );
 }

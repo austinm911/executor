@@ -67,8 +67,30 @@ export type SourceRevision = typeof SourceRevision.Type;
 export const SourceSnapshot = Schema.Struct({ revision: SourceRevision, files: SourceFiles });
 export type SourceSnapshot = typeof SourceSnapshot.Type;
 
-/** A saved commit. The caller already holds the files it sent, so they are not echoed back. */
-export const CommittedSource = Schema.Struct({ revision: SourceRevision });
+/**
+ * The listed removals stay small beside the revision, however many files a save drops: `bytes`
+ * bounds the encoded JSON of `paths`, so the whole result stays far below an execute result.
+ */
+export const removalLimits = { paths: 100, bytes: 16 * 1024 } as const;
+
+/** What a save removed: the total and the first paths, bounded so the result is never cut off. */
+export const SourceRemovals = Schema.Struct({
+  count: Schema.Int.annotate({
+    description: "How many files of the `expected` revision this save removed. 0 when none.",
+  }),
+  paths: Schema.Array(SourceFilePath).annotate({
+    description:
+      "The first removed paths, sorted: at most 100, fewer when they are long. When `count` is larger, the rest are the paths of the files you read at `expected` that you did not send. The removed files stay readable at `expected`.",
+  }),
+});
+export type SourceRemovals = typeof SourceRemovals.Type;
+
+/**
+ * A saved commit. The caller already holds the files it sent, so they are not echoed back.
+ * A save replaces the complete file list, so it names the files the previous revision had that
+ * the new one does not; a commit does not deploy, so an unintended removal shows before it runs.
+ */
+export const CommittedSource = Schema.Struct({ revision: SourceRevision, removed: SourceRemovals });
 export type CommittedSource = typeof CommittedSource.Type;
 
 const sourceFailures = {
@@ -103,6 +125,53 @@ export const SourceError = ApiError.define({
 });
 export type SourceError = typeof SourceError.Type;
 
+/**
+ * Git stores a path as either a file or a folder, so a file list that has both `a` and `a/b`
+ * would silently lose one of them. Saves refuse it, naming the file and a path inside it.
+ */
+export const SourcePathConflict = ApiError.define({
+  tag: "SourcePathConflict",
+  status: 400,
+  fields: { file: SourceFilePath, nested: SourceFilePath },
+  message: ({ file, nested }) =>
+    `The files use ${file} as both a file and a folder: ${nested} is inside it. Git can store only one of them. Rename or remove one, then save again. Nothing was saved.`,
+  recorded: () => "The files use one path as both a file and a folder. Nothing was saved.",
+});
+export type SourcePathConflict = typeof SourcePathConflict.Type;
+
+/**
+ * Git stores paths as UTF-8, which cannot hold a lone UTF-16 surrogate: encoding replaces it
+ * with U+FFFD, so two paths that differ here could become one file. Saves refuse it.
+ */
+export const SourcePathNotUnicode = ApiError.define({
+  tag: "SourcePathNotUnicode",
+  status: 400,
+  fields: { path: SourceFilePath },
+  message: ({ path }) =>
+    `The file path ${JSON.stringify(path)} is not valid Unicode: it has a lone surrogate, a \\uD800-\\uDFFF character without its pair. Git stores paths as UTF-8, which cannot hold it. Rename the file, then save again. Nothing was saved.`,
+  recorded: () => "A file path is not valid Unicode. Nothing was saved.",
+});
+export type SourcePathNotUnicode = typeof SourcePathNotUnicode.Type;
+
+/**
+ * Refuse a file list whose paths would not each be one distinct Git path: a path that is not
+ * valid Unicode, or a file's path that is also a folder of another file.
+ */
+export const sourcePathsFit = (files: ReadonlyArray<SourceFile>) => {
+  // With the `u` flag, a surrogate pair is one code point, so this matches only a lone surrogate.
+  const lone = files.find((file) => /\p{Cs}/u.test(file.path));
+  if (lone !== undefined) return Effect.fail(new SourcePathNotUnicode({ path: lone.path }));
+  const paths = new Set(files.map((file) => file.path));
+  for (const nested of [...paths].sort()) {
+    const segments = nested.split("/");
+    for (let depth = 1; depth < segments.length; depth++) {
+      const file = segments.slice(0, depth).join("/");
+      if (paths.has(file)) return Effect.fail(new SourcePathConflict({ file, nested }));
+    }
+  }
+  return Effect.void;
+};
+
 /** Transport status follows the failure reason while preserving the SourceError domain value. */
 export const sourceErrors = [
   SourceError.check(Schema.makeFilter((error) => error.reason === "conflict")).annotate({
@@ -128,7 +197,27 @@ export const sourceErrors = [
   SourceError.check(
     Schema.makeFilter((error) => error.reason === "git" || error.reason === "storage"),
   ).annotate({ identifier: "SourceUnavailable", httpApiStatus: 503 }),
+  SourcePathNotUnicode,
+  SourcePathConflict,
 ] as const;
+
+/** Count the previous revision's paths that a complete file list leaves out, and list the first. */
+export const removedPaths = (
+  previous: Iterable<string>,
+  files: ReadonlyArray<SourceFile>,
+): SourceRemovals => {
+  const kept = new Set(files.map((file) => file.path));
+  const removed = [...previous].filter((path) => !kept.has(path)).sort();
+  const paths: string[] = [];
+  // Measure the JSON the list is sent as, where an escaped character can take six bytes.
+  let bytes = "[]".length;
+  for (const path of removed.slice(0, removalLimits.paths)) {
+    bytes += new TextEncoder().encode(JSON.stringify(path)).length + (paths.length > 0 ? 1 : 0);
+    if (bytes > removalLimits.bytes) break;
+    paths.push(path);
+  }
+  return { count: removed.length, paths };
+};
 
 /** Hosts must retain successful writes while any deployment or release references them. */
 export interface AppSourceStorage {
@@ -143,7 +232,7 @@ export interface AppSourceStorage {
     readonly expected: string | null;
     readonly files: SourceFiles;
     readonly message: string;
-  }) => Effect.Effect<SourceSnapshot, SourceError>;
+  }) => Effect.Effect<SourceSnapshot & Pick<CommittedSource, "removed">, SourceError>;
 }
 
 /** Portable branch names, including the private retention prefix used by the source service. */
@@ -191,14 +280,20 @@ export interface RepositoryBackend {
     id: AppCodeId,
     ref: string,
   ) => Effect.Effect<{ readonly commit: string; readonly files: SourceFiles }, SourceError>;
-  /** Create the repository for an initial write; existing writes must match the supplied revision. */
+  /**
+   * Create the repository for an initial write; existing writes must match the supplied revision.
+   * Returns the new commit and the paths of the expected revision that the files leave out.
+   */
   readonly commit: (input: {
     readonly id: AppCodeId;
     readonly branch: string;
     readonly expected: string | null;
     readonly files: SourceFiles;
     readonly message: string;
-  }) => Effect.Effect<typeof SourceCommit.Type, SourceError>;
+  }) => Effect.Effect<
+    { readonly commit: typeof SourceCommit.Type; readonly removed: SourceRemovals },
+    SourceError
+  >;
   /** Serve one Git smart-HTTP request against the repository. */
   readonly request: (id: AppCodeId, request: Request) => Effect.Effect<Response, SourceError>;
 }

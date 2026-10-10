@@ -38,16 +38,13 @@ export const recordConnection = (
   Effect.gen(function* () {
     const actor = yield* currentResourceAuthority;
     const sql = yield* policyDatabase;
-    const encodedTarget = yield* Schema.encodeEffect(ConnectionAccess.fields.target)(
-      connection.target === null
-        ? null
-        : {
-            app: connection.target.app,
-            requirement: connection.target.requirement,
-            profile: connection.target.profile,
-          },
+    const target = JSON.stringify(
+      yield* Schema.encodeEffect(ConnectionAccess.fields.target)({
+        app: connection.target.app,
+        requirement: connection.target.requirement,
+        profile: connection.target.profile,
+      }),
     );
-    const target = encodedTarget === null ? null : JSON.stringify(encodedTarget);
     yield* sql.withTransaction(
       Effect.gen(function* () {
         yield* checkDestination(destination);
@@ -70,17 +67,13 @@ export const connectionAccess = (connection: AccountConnectionId) =>
     and creator_id = ${actor.user}`;
     const access = (yield* Schema.decodeUnknownEffect(Schema.Array(ConnectionAccess))(rows))[0];
     if (access === undefined) return yield* new OrganizationForbidden();
-    if (access.target !== null) {
-      {
-        yield* requireAppAccess(access.target.app, "use");
-        yield* ownProfile(
-          yield* Effect.flatten(HostedExecutor),
-          yield* currentOwner,
-          access.target.app,
-          access.target.profile,
-        );
-      }
-    }
+    yield* requireAppAccess(access.target.app, "use");
+    yield* ownProfile(
+      yield* Effect.flatten(HostedExecutor),
+      yield* currentOwner,
+      access.target.app,
+      access.target.profile,
+    );
     yield* checkDestination(access.destination);
     return access;
   }).pipe(

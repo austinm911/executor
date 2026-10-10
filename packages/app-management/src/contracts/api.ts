@@ -214,7 +214,7 @@ export const appManagementApi = <I extends HttpApiMiddleware.AnyId, S>(
           error: appOperationErrors,
         }).annotate(
           OpenApi.Description,
-          "Save the complete file list as a Git commit. Omitted files are removed. expected must match the revision read before editing. A commit does not deploy. Returns the new revision; the files are not echoed.",
+          "Save the complete file list as a Git commit. Omitted files are removed. expected must match the revision read before editing. A commit does not deploy. Returns the new revision and `removed`: how many files this save removed and the first of their paths; the files are not echoed. If `removed.count > 0`, check it before deploying. A removed file stays at the `expected` revision: to keep it, commit again against the new revision with it. A file path cannot also be a folder (`a` and `a/b`); such a save fails with SourcePathConflict and saves nothing. Paths must be valid Unicode; a lone surrogate fails with SourcePathNotUnicode.",
         ),
         HttpApiEndpoint.post("deploy", "/apps/:app/deploy", {
           params: app,

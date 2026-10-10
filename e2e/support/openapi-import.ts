@@ -266,6 +266,30 @@ export const openapi32Upstream = Effect.gen(function* () {
   return { origin, requests: Ref.get(requests) };
 });
 
+/** An API that answers every request with its method, path with query, and Authorization header. */
+export const credentialEchoUpstream = Effect.gen(function* () {
+  const services = yield* Layer.build(
+    HttpRouter.serve(
+      HttpRouter.add(
+        "*",
+        "/*",
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          return yield* HttpServerResponse.json({
+            method: request.method,
+            url: request.url,
+            authorization: request.headers.authorization ?? null,
+          });
+        }),
+      ),
+      { disableLogger: true, disableListenLog: true },
+    ).pipe(Layer.provideMerge(NodeHttpServer.layer(createServer, { host: "127.0.0.1", port: 0 }))),
+  );
+  const server = yield* HttpServer.HttpServer.pipe(Effect.provideContext(services));
+  if (!("port" in server.address)) return yield* Effect.die("Fixture must listen on TCP");
+  return { origin: `http://127.0.0.1:${server.address.port}` };
+});
+
 /** Deploy a public app with the given `index.ts`; it is deleted when the scenario ends. */
 export const deployPublicApp = (index: string) =>
   Effect.gen(function* () {

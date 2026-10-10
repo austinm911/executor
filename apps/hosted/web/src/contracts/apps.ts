@@ -304,7 +304,7 @@ const submitConnection = Atom.family((key: ConnectionKey) =>
               get,
               key,
               saved,
-              Option.isSome(connection) ? (connection.value.target?.app ?? null) : null,
+              Option.isSome(connection) ? connection.value.target.app : null,
             );
             get.refresh(connectionAtom(key));
           }),
@@ -314,17 +314,16 @@ const submitConnection = Atom.family((key: ConnectionKey) =>
   ),
 );
 const completeOAuth = Atom.family((key: ConnectionKey) =>
-  HostedClient.runtime.fn(
-    (input: { callbackUrl: Redacted.Redacted<string>; app: AppId | null }, get) =>
-      Effect.flatMap(HostedClient, (client) =>
-        client.accounts.completeOAuth({ params: key, payload: { callbackUrl: input.callbackUrl } }),
-      ).pipe(
-        Effect.tap((saved) =>
-          Effect.sync(() => {
-            connectionSaved(get, key, saved, input.app);
-          }),
-        ),
+  HostedClient.runtime.fn((input: { callbackUrl: Redacted.Redacted<string>; app: AppId }, get) =>
+    Effect.flatMap(HostedClient, (client) =>
+      client.accounts.completeOAuth({ params: key, payload: { callbackUrl: input.callbackUrl } }),
+    ).pipe(
+      Effect.tap((saved) =>
+        Effect.sync(() => {
+          connectionSaved(get, key, saved, input.app);
+        }),
       ),
+    ),
   ),
 );
 /** The callback's OAuth state, not the browser tab, identifies the connection it completes. */
@@ -363,7 +362,7 @@ const startOAuth = Atom.family((key: ConnectionKey) =>
                 get,
                 key,
                 result.account,
-                Option.isSome(connection) ? (connection.value.target?.app ?? null) : null,
+                Option.isSome(connection) ? connection.value.target.app : null,
               );
             }
           }),
@@ -412,8 +411,8 @@ export const PendingOAuth = Schema.Struct({
   organization: OrganizationReference,
   organizationSlug: Schema.NonEmptyString,
   connection: AccountConnectionId,
-  app: Schema.NullOr(AppId),
-  profile: Schema.optional(ProfileId),
+  app: AppId,
+  profile: ProfileId,
   redirectUri: HttpUrl,
   /** A reconnect keeps its account name, so completion does not ask for one. */
   reconnect: Schema.optionalKey(Schema.Boolean),

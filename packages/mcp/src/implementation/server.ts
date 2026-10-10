@@ -74,10 +74,11 @@ const observeExecution =
                   "error.type": "CapacityExceeded",
                 }),
               ),
-              Match.when({ status: "unavailable" }, () =>
+              Match.when({ status: "unavailable" }, ({ reason }) =>
                 Effect.annotateCurrentSpan({
                   "executor.outcome": "failed",
                   "error.type": "ContinuationUnavailable",
+                  "executor.resume.unavailable_reason": reason,
                 }),
               ),
               Match.when({ status: "busy" }, () =>
@@ -208,7 +209,7 @@ export const makeMcp = (options: McpOptions) =>
                         caller.pipe(
                           Effect.flatMap(({ id, sessionId }) =>
                             executions
-                              .execute(id, options.backend, code)
+                              .execute(id, options.backend, code, "result")
                               .pipe(
                                 Effect.flatMap((result) => withLink(result, sessionId, delivery)),
                               ),
@@ -234,7 +235,7 @@ export const makeMcp = (options: McpOptions) =>
                                   );
                               const pending = yield* executions.pendingInteraction(id, requestId);
                               return yield* pending === undefined
-                                ? Effect.succeed({ status: "unavailable" as const, requestId })
+                                ? executions.unavailable(id, requestId)
                                 : withLink(pending, sessionId, delivery);
                             }),
                           ),
@@ -249,7 +250,9 @@ export const makeMcp = (options: McpOptions) =>
                     McpToolkit.toLayer({
                       execute: ({ code }) =>
                         caller.pipe(
-                          Effect.flatMap(({ id }) => executions.execute(id, options.backend, code)),
+                          Effect.flatMap(({ id }) =>
+                            executions.execute(id, options.backend, code, "result"),
+                          ),
                           observeExecution("mcp.execute"),
                         ),
                       resume: (input) =>

@@ -83,10 +83,9 @@ export const targetProvider = (db: Query, target: StoredConnectionTarget, provid
  */
 export const requireTargetProvider = (
   db: Query,
-  row: { readonly target: StoredConnectionTarget | null; readonly provider: ProviderId },
+  row: { readonly target: StoredConnectionTarget; readonly provider: ProviderId },
 ) =>
   Effect.gen(function* () {
-    if (row.target === null) return undefined;
     const shown = yield* targetProvider(db, row.target, row.provider);
     if (shown === undefined)
       return yield* new AccountConnectionTargetChanged({

@@ -705,7 +705,24 @@ export const compileOpenApiDocument = (
             });
             if (request.required) required.push("body");
           }
-          const security = operation.security ?? spec.security ?? fallback ?? [];
+          const requirements = operation.security ?? spec.security ?? fallback ?? [];
+          // An alternative naming a scheme securitySchemes does not declare can never be met. It is
+          // ignored, so it neither hides another alternative nor reaches the request. When every
+          // alternative is ignored, the operation is left out rather than made public.
+          const security = requirements.filter((requirement) =>
+            Object.keys(requirement).every((key) => Object.hasOwn(schemes, key)),
+          );
+          if (security.length === 0 && requirements.length > 0) {
+            const undeclared = [
+              ...new Set(
+                requirements.flatMap(Object.keys).filter((key) => !Object.hasOwn(schemes, key)),
+              ),
+            ];
+            fail(
+              "auth_method",
+              `Every security requirement names a scheme securitySchemes does not declare: ${undeclared.map((key) => JSON.stringify(key)).join(", ")}. Declare and fill every scheme in one complete alternative (securitySchemes plus methods or oauth).`,
+            );
+          }
           for (const requirement of security) {
             const keys = Object.keys(requirement).sort();
             if (!keys.length) continue;
@@ -759,14 +776,9 @@ export const compileOpenApiDocument = (
               baseUrl,
               openapi: spec.openapi,
               securitySchemes: Object.fromEntries(
-                [...new Set(security.flatMap(Object.keys))].map((key) => [
-                  key,
-                  schemes[key] ??
-                    fail(
-                      "auth_method",
-                      `A security requirement names ${JSON.stringify(key)}, which securitySchemes does not declare.`,
-                    ),
-                ]),
+                Object.entries(schemes).filter(([key]) =>
+                  security.some((requirement) => Object.hasOwn(requirement, key)),
+                ),
               ),
               request: {
                 parameters: [...parameters.values()].map(({ parameter }) => parameter),

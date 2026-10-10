@@ -51,15 +51,12 @@ export const makeAccountConnections = (
     owner: row.owner,
     provider,
     reconnectAccount,
-    target:
-      row.target === null
-        ? null
-        : {
-            app: row.target.app,
-            requirement: row.target.requirement,
-            name: row.target.name,
-            profile: row.target.profile,
-          },
+    target: {
+      app: row.target.app,
+      requirement: row.target.requirement,
+      name: row.target.name,
+      profile: row.target.profile,
+    },
     createdAt: row.createdAt,
     expiresAt: row.expiresAt,
     state: row.state,
@@ -79,8 +76,7 @@ export const makeAccountConnections = (
       );
     });
   /** Ended requests keep showing the provider they used, even after their app changed. */
-  const endedProvider = (row: ConnectionRow) =>
-    row.target === null ? Effect.succeed(undefined) : targetProvider(db, row.target, row.provider);
+  const endedProvider = (row: ConnectionRow) => targetProvider(db, row.target, row.provider);
   const get = (input: typeof GetAccountConnection.Type) =>
     Effect.gen(function* () {
       const row = yield* readConnection(db, input);
@@ -190,16 +186,13 @@ export const makeAccountConnections = (
               id: row.id,
               owner: row.owner,
               reconnectAccount: row.reconnectAccount,
-              target:
-                row.target === null
-                  ? null
-                  : {
-                      app: row.target.app,
-                      profile: yield* storedProfile(tx, {
-                        app: row.target.app,
-                        profile: row.target.profile,
-                      }),
-                    },
+              target: {
+                app: row.target.app,
+                profile: yield* storedProfile(tx, {
+                  app: row.target.app,
+                  profile: row.target.profile,
+                }),
+              },
             });
           yield* finishConnection(tx, row, account);
           return account;

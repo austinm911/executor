@@ -150,31 +150,32 @@ const errorBodyLimits = { maxBytes: 65_536, readTimeoutMs: 2_000 } as const;
  * A bounded copy of a JSON error body, so the error it states can be reported and the SDK still
  * reads the same body. Other bodies are left unread; an unreadable one becomes empty.
  */
-const errorBody = (response: HttpClientResponse.HttpClientResponse) =>
-  Effect.gen(function* () {
-    const json = /^application\/(?:[\w.-]+\+)?json$/i.test(
-      response.headers["content-type"]?.split(";")[0]?.trim() ?? "",
-    );
-    const length = response.headers["content-length"];
-    if (!json || (length !== undefined && Number(length) > errorBodyLimits.maxBytes))
-      return { body: Stream.toReadableStream(response.stream), upstream: undefined };
-    // An unreadable, oversized or stalled body states nothing; the refusal keeps its status.
-    const unreadable = new McpError({ phase: "transport", reason: "invalid_response" });
-    const read = yield* response.stream.pipe(
-      Stream.mapError(() => unreadable),
-      Stream.limitBytes(errorBodyLimits.maxBytes, () => Stream.fail(unreadable)),
-      Stream.decodeText,
-      Stream.mkString,
-      Effect.timeout(errorBodyLimits.readTimeoutMs),
-      Effect.option,
-    );
-    if (Option.isNone(read)) return { body: null, upstream: undefined };
-    const parsed = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Json))(read.value);
-    return {
-      body: read.value,
-      upstream: Option.isSome(parsed) ? bodyUpstreamError(parsed.value) : undefined,
-    };
-  });
+const errorBody = Effect.fn("McpClient.errorBody")(function* (
+  response: HttpClientResponse.HttpClientResponse,
+) {
+  const json = /^application\/(?:[\w.-]+\+)?json$/i.test(
+    response.headers["content-type"]?.split(";")[0]?.trim() ?? "",
+  );
+  const length = response.headers["content-length"];
+  if (!json || (length !== undefined && Number(length) > errorBodyLimits.maxBytes))
+    return { body: Stream.toReadableStream(response.stream), upstream: undefined };
+  // An unreadable, oversized or stalled body states nothing; the refusal keeps its status.
+  const unreadable = new McpError({ phase: "transport", reason: "invalid_response" });
+  const read = yield* response.stream.pipe(
+    Stream.mapError(() => unreadable),
+    Stream.limitBytes(errorBodyLimits.maxBytes, () => Stream.fail(unreadable)),
+    Stream.decodeText,
+    Stream.mkString,
+    Effect.timeout(errorBodyLimits.readTimeoutMs),
+    Effect.option,
+  );
+  if (Option.isNone(read)) return { body: null, upstream: undefined };
+  const parsed = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Json))(read.value);
+  return {
+    body: read.value,
+    upstream: Option.isSome(parsed) ? bodyUpstreamError(parsed.value) : undefined,
+  };
+});
 
 const sentMethod = Schema.decodeUnknownOption(
   Schema.fromJsonString(Schema.Struct({ method: Schema.String })),
@@ -279,6 +280,20 @@ const explain = <E>(
   responses: ErrorResponses,
 ) => {
   if (Schema.is(ProviderError)(error)) return providerErrorDetail(error, { phase });
+  // A tool call's request that failed without an answer, such as on a closed connection, failed
+  // the call, which the server may already have run; it is not a failure to connect.
+  if (
+    phase === "call" &&
+    Schema.is(McpError)(error) &&
+    error.phase === "transport" &&
+    error.reason === "request"
+  )
+    return new McpError({
+      phase,
+      reason: error.reason,
+      ...(error.status === undefined ? {} : { status: error.status }),
+      ...(error.upstream === undefined ? {} : { upstream: error.upstream }),
+    });
   if (!Schema.is(McpError)(error) || error.status === undefined) return error;
   const response = responses.get(error.status);
   if (

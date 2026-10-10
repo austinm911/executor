@@ -28,7 +28,7 @@ const refusal = (message: string) => ({
   error: {
     // JSON-RPC Invalid Request, as for the MCP transport's own rejections.
     code: -32600,
-    message: `GrantForbidden (HTTP 403): ${message}`,
+    message: `GrantForbidden (HTTP 403): ${message} Retryable (unchanged call): no.`,
     data: { code: "GrantForbidden", status: 403 },
   },
 });

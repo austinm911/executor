@@ -366,15 +366,42 @@ export const eventIndexes = [
   "CREATE INDEX IF NOT EXISTS executor_events_created ON executor_events (created_at)",
 ] as const;
 
+/**
+ * Version 4.0.8 requires every connection to name the app profile requirement it fills. Before it,
+ * provider-only requests, account-level reconnects and 1.3.0-era requests stored no target.
+ */
+const targetedConnections = table("executor_account_connections", {
+  ...version4Tables.accountConnections.columns,
+  target: column("target", Schema.Json),
+});
+
+/** Tables of the 4.0.8 layout. */
+export const version408Tables = { ...version407Tables, accountConnections: targetedConnections };
+
+/**
+ * Removes the connections that have no target, and the pending sign-ins they point at, before the
+ * column becomes required. A missing target is SQL null when a server wrote it and JSON null when
+ * the column's old default filled it. Owner removal deletes a connection's sign-in the same way.
+ * Nothing else references a connection: hosted access rows cascade with it, and accounts a
+ * completed connection saved are kept. Servers since #2135 cannot create one.
+ */
+const targetless = "target IS NULL OR json_typeof(target) = 'null'";
+export const targetlessConnectionCleanup = [
+  `DELETE FROM executor_oauth_attempts WHERE id IN (
+    SELECT oauth_attempt FROM executor_account_connections
+    WHERE (${targetless}) AND oauth_attempt IS NOT NULL)`,
+  `DELETE FROM executor_account_connections WHERE ${targetless}`,
+] as const;
+
 /** Current ORM layout. Profiles own account selections; apps declare requirements. */
 export const storageSchema = schema({
-  version: "4.0.7",
-  tables: version407Tables,
+  version: "4.0.8",
+  tables: version408Tables,
   up: ({ auto }) =>
     auto.pipe(
       Effect.map((operations) => [
+        ...targetlessConnectionCleanup.map((sql) => ({ type: "custom" as const, sql })),
         ...operations,
-        ...eventIndexes.map((sql) => ({ type: "custom" as const, sql })),
       ]),
     ),
   relations: {

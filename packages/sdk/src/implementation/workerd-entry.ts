@@ -15,7 +15,7 @@ import {
   DeclaredRequirements,
   HostRequirementsError,
   HostResponse,
-  ResolvedAccounts,
+  HostAccounts,
   WorkflowRunId,
   WorkflowFailure,
   WorkflowRpcResult,
@@ -31,10 +31,12 @@ import {
   FacetInvocation,
   type FacetBundle,
 } from "@executor-js/app-data/cloudflare";
+import { EvaluatedCommandJson, EvaluatedReplyJson } from "@executor-js/app-data/evaluated";
 import { makeAppRunner } from "./app-runner.ts";
 import { credentialFetch, credentialKey } from "./credential-handles.ts";
 import {
   defaultAppWorkerLimit,
+  defaultAppWorkerIdleSeconds,
   makeAppWorkerResidency,
   type AppWorkerResidency,
 } from "./app-worker-residency.ts";
@@ -67,6 +69,7 @@ declare const WebSocketPair: { new (): { 0: NativeWebSocket; 1: NativeWebSocket 
 type Callback = (input: unknown) => Promise<unknown>;
 interface DataEntrypoint {
   cache(namespace: string, command: unknown): Promise<unknown>;
+  evaluated(command: unknown): Promise<unknown>;
   invoke(
     input: typeof FacetInvocation.Type,
     load: () => Promise<typeof FacetBundle.Type>,
@@ -74,6 +77,7 @@ interface DataEntrypoint {
     controls: Callback | null,
   ): Promise<unknown>;
   cancel(id: string): Promise<void>;
+  unload(identity: string): Promise<boolean>;
   fetch(request: Request): Promise<Response>;
 }
 interface NativeStepPort {
@@ -100,6 +104,12 @@ interface HttpService {
 }
 interface Environment {
   readonly AUTH: string;
+  /**
+   * The secret credential handles are sealed with, derived from the instance's encryption key so
+   * it is the same after a restart and never a value anyone else knows. Only this host's runner
+   * and outbound read it; app code never does.
+   */
+  readonly CREDENTIAL_SECRET: string;
   /** Host decision, not an app capability: apps never see or change this binding. */
   readonly APPS_PRIVATE_FETCH: boolean;
   /** workerd network service that refuses private, loopback and link-local destinations. */
@@ -113,6 +123,8 @@ interface Environment {
   readonly LOADER: WorkerLoader;
   /** Most app Workers this process keeps loaded, or null for the default. */
   readonly APP_WORKERS?: number | null;
+  /** Seconds an idle app Worker stays loaded, zero for no idle unloading, or null for the default. */
+  readonly APP_WORKER_IDLE_SECONDS?: number | null;
   readonly DATA: { getByName(name: string): DataEntrypoint };
   readonly RUNS: Workflow<{ run: string }>;
   readonly HOST: Fetcher;
@@ -125,7 +137,7 @@ const buildFailed = (stage: RuntimeBuildFailed["stage"], cause: unknown) =>
 const OutboundProps = Schema.Struct({ app: Schema.NonEmptyString });
 type OutboundProps = typeof OutboundProps.Type;
 /** Handles are sealed with a key derived from the secret only this host and its runner share. */
-const credentials = (env: Environment) => credentialKey(env.AUTH);
+const credentials = (env: Environment) => credentialKey(env.CREDENTIAL_SECRET);
 /**
  * Every app isolate's global `fetch`, bound to its app. It substitutes the credential handles the
  * request carries when its target is allowed; see credential-handles.ts.
@@ -191,7 +203,16 @@ let residency: AppWorkerResidency | undefined;
 const runner = (env: Environment, context: Pick<ExecutionContext, "waitUntil" | "exports">) =>
   makeAppRunner({
     loader: env.LOADER,
-    residency: (residency ??= makeAppWorkerResidency(env.APP_WORKERS ?? defaultAppWorkerLimit)),
+    residency: (residency ??= makeAppWorkerResidency({
+      limit: env.APP_WORKERS ?? defaultAppWorkerLimit,
+      idleSeconds: env.APP_WORKER_IDLE_SECONDS ?? defaultAppWorkerIdleSeconds,
+    })),
+    // A later call's trim runs this, so the stub is made then, in that call's request.
+    unloadFacet: (app, identity) =>
+      Effect.tryPromise({
+        try: () => env.DATA.getByName(app).unload(identity),
+        catch: (cause) => cause,
+      }),
     outbound: appOutbound(context),
     credentialKey: credentials(env),
     data: (app) => {
@@ -367,8 +388,14 @@ export class AppDataSupervisor extends DurableObject<Environment> {
   async cache(namespace: string, command: unknown) {
     return Effect.runPromise((await this.#supervisor).cache(namespace, command));
   }
+  async evaluated(command: unknown) {
+    return Effect.runPromise((await this.#supervisor).evaluated(command));
+  }
   async cancel(id: string) {
     return Effect.runPromise((await this.#supervisor).cancel(id));
+  }
+  async unload(identity: string) {
+    return Effect.runPromise((await this.#supervisor).unload(identity));
   }
   async alarm() {
     return Effect.runPromise((await this.#supervisor).recover);
@@ -435,7 +462,7 @@ export class AppWorkflows extends WorkflowEntrypoint<Environment, { run: string 
             },
             resolve: () =>
               hostRequest(this.env, { operation: "context", run: seed.runId }).pipe(
-                Effect.flatMap(Schema.decodeUnknownEffect(ResolvedAccounts)),
+                Effect.flatMap(Schema.decodeUnknownEffect(HostAccounts)),
                 Effect.map(
                   (accounts) => ({ accounts: Redacted.make(accounts) }) satisfies HostContext,
                 ),
@@ -526,6 +553,17 @@ export default {
       return newWorkersRpcResponse(request, new AppApi(env, context), rpcOptions);
     if (url.pathname === "/changes")
       return env.DATA.getByName(url.searchParams.get("app") ?? "").fetch(request);
+    // Evaluated results the host keeps in the app's supervisor, beside its app cache.
+    if (url.pathname === "/evaluated") {
+      const command = Schema.decodeUnknownOption(EvaluatedCommandJson)(await request.text());
+      if (command._tag === "None") return new Response(null, { status: 400 });
+      const reply = await env.DATA.getByName(url.searchParams.get("app") ?? "").evaluated(
+        command.value,
+      );
+      return new Response(Schema.encodeUnknownSync(EvaluatedReplyJson)(reply), {
+        headers: { "content-type": "application/json" },
+      });
+    }
     const input = Schema.decodeUnknownSync(
       Schema.Struct({
         operation: Schema.Literals(["start", "status", "terminate"]),

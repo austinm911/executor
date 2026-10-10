@@ -9,10 +9,9 @@ import { Clock, Effect, Redacted, Schema } from "effect";
 import { randomUUID } from "node:crypto";
 import { Api, body, type Session } from "../support/api.ts";
 import { TestLive, withCase } from "../support/case.ts";
-import { Resource } from "../support/contracts.ts";
 import { oauthSetupIssuer } from "../support/oauth-setup-issuer.ts";
 import { Target } from "../support/platform.ts";
-import { createProfile, selectProfileAccounts } from "../support/profiles.ts";
+import { connectLocalAccount, createProfile } from "../support/profiles.ts";
 import { appBuildLoads } from "../support/build-loads.ts";
 import { Observation, observerApp, RunObservation } from "../support/worker-observer.ts";
 import { scenarios } from "../test-plan.ts";
@@ -83,21 +82,22 @@ const localApp = (resource: string) =>
     const path = `/v1/apps/${app.id}`;
     const connect = (token: string) =>
       Effect.gen(function* () {
-        const created = yield* api.request(agent, "POST", "/v1/accounts", {
-          owner,
-          provider: app.requirements.accounts.service.provider,
-          method: "key",
-          label: name,
-          fields: { token },
-        });
-        expect(created.status, JSON.stringify(created.body)).toBe(200);
-        const account = (yield* body(Resource, created)).id;
-        resources.accounts.push(account);
         const profile = yield* createProfile(agent, path, { owner, subject: "local" });
-        expect(
-          (yield* selectProfileAccounts(agent, path, profile.id, { service: account })).status,
-        ).toBe(200);
+        const account = (yield* connectAccount({ profile: profile.id, token })).id;
+        resources.accounts.push(account);
         return { account, profile: profile.id };
+      });
+    /** Save an account for the profile's requirement, or replace the given account's key. */
+    const connectAccount = (input: { profile: string; token: string; account?: string }) =>
+      connectLocalAccount(agent, {
+        owner,
+        app: app.id,
+        profile: input.profile,
+        requirement: "service",
+        method: "key",
+        label: name,
+        fields: { token: input.token },
+        ...(input.account === undefined ? {} : { account: input.account }),
       });
     const observe = (profile: string) =>
       Effect.gen(function* () {
@@ -142,7 +142,7 @@ const localApp = (resource: string) =>
           yield* Effect.sleep("100 millis");
         }
       });
-    return { agent, api, app: app.id, connect, observe, run };
+    return { agent, api, app: app.id, connect, connectAccount, observe, run };
   });
 
 layer(TestLive, { excludeTestServices: true })("Local app worker reuse", (it) => {
@@ -151,20 +151,19 @@ layer(TestLive, { excludeTestServices: true })("Local app worker reuse", (it) =>
       context,
       Effect.gen(function* () {
         const issuer = yield* oauthSetupIssuer;
-        const { agent, api, app, connect, observe, run } = yield* localApp(
+        const { app, connect, connectAccount, observe, run } = yield* localApp(
           `${issuer.origin}/resource`,
         );
         const first = yield* connect("synthetic-local-0");
         const observed: Array<typeof Observation.Type> = [yield* run(first.profile)];
         for (let round = 1; round <= rotations; round++) {
           const token = `synthetic-local-${round}`;
-          const replaced = yield* api.request(
-            agent,
-            "PUT",
-            `/v1/accounts/${first.account}/credentials`,
-            { fields: { token } },
-          );
-          expect(replaced.status, JSON.stringify(replaced.body)).toBe(200);
+          const replaced = yield* connectAccount({
+            profile: first.profile,
+            token,
+            account: first.account,
+          });
+          expect(replaced.id).toBe(first.account);
           const call = yield* observe(first.profile);
           const workflow = yield* run(first.profile);
           expect(workflow.run).toBe(workflow.id);

@@ -6,7 +6,7 @@ import {
   type ApprovalRequestId,
   type SelectedAccounts,
   type Tool,
-  type ToolResumeResult,
+  type ToolResumeResultReceived,
 } from "@executor-js/sdk";
 import type { BrowserToolRun } from "@executor-js/mcp/browser";
 import { Cause, Exit, Match, Option, Schema } from "effect";
@@ -120,7 +120,7 @@ export function toolRunContext(
  * needs approval and may already have made changes, so this states only what Executor did with the
  * saved call: never that the tool did not run.
  */
-const answered = (result: ToolResumeResult) =>
+const answered = (result: ToolResumeResultReceived) =>
   Match.value(result).pipe(
     Match.discriminatorsExhaustive("status")({
       completed: ({ toolError }) =>
@@ -129,20 +129,25 @@ const answered = (result: ToolResumeResult) =>
           : "Approved. The tool ran, and its result is below.",
       denied: () => "Declined. Executor will not resume this saved call.",
       cancelled: () => "Cancelled. Executor will not resume this saved call.",
-      failed: ({ reason }) =>
-        Match.value(reason).pipe(
+      failed: (failed) =>
+        Match.value(failed).pipe(
           Match.when(
-            "context-changed",
+            { reason: "context-changed" },
             () =>
               "The app, profile or accounts changed since this call was saved, so Executor did not resume it. Run it again to review the current call.",
           ),
           Match.when(
-            "execution-failed",
+            { reason: "execution-failed", context: "unconfirmed" },
+            () =>
+              "Executor could not read the app, profile or accounts to confirm they match the call you reviewed, because its storage failed, so it did not resume it. Run it again in a moment to review it.",
+          ),
+          Match.when(
+            { reason: "execution-failed" },
             () =>
               "The tool failed after you approved it. It may have already made changes. Check before running it again.",
           ),
           Match.when(
-            "expired",
+            { reason: "expired" },
             () => "This request expired, so Executor will not resume this saved call.",
           ),
           Match.exhaustive,

@@ -137,7 +137,7 @@ layer(HostedLive, { excludeTestServices: true })("PAT MCP", (it) => {
               // JSON-RPC Invalid Request, as for the MCP transport's own rejections.
               error: {
                 code: -32600,
-                message: `${code} (HTTP 403): ${message}`,
+                message: `${code} (HTTP 403): ${message} Retryable (unchanged call): no.`,
                 data: { code, status: 403 },
               },
             });

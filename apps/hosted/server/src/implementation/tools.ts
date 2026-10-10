@@ -1,10 +1,10 @@
 import { authorizeTarget, authorizeTool } from "./authorization.ts";
 import { permitsRouter, permitsTool, requiresToolMetadata } from "@executor-js/authorization";
 import {
+  approvalRequired,
   RequestInvalid,
   ToolApprovalIssuer,
   ToolApprovalNotFound,
-  ToolApprovalRequired,
   ToolNotFound,
   type AppId,
   type ApprovalRequestId,
@@ -122,13 +122,7 @@ const startTool = (
 export const callTool = (input: Parameters<Executor["tools"]["call"]>[0]) =>
   Effect.flatMap(startTool(input), (result) =>
     result.status === "approval-required"
-      ? Effect.fail(
-          new ToolApprovalRequired({
-            app: result.invocation.app,
-            deployment: result.invocation.deployment,
-            tool: result.invocation.tool,
-          }),
-        )
+      ? Effect.fail(approvalRequired(result))
       : Effect.succeed(result.value),
   );
 /**
@@ -190,7 +184,8 @@ export const hostedToolHandlers = HttpApiBuilder.group(HostedApi, "tools", (hand
             status: "approval-required",
             requestId: params.requestId,
             invocation,
-            // Built from the saved call, so the prompt shows exactly what approval resumes.
+            // Built from the saved call, so it describes what approval resumes; the review card
+            // shows the exact arguments from the invocation.
             elicitation: approvalElicitation(invocation.tool, invocation.input),
             expiresAt,
           },

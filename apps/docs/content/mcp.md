@@ -58,15 +58,18 @@ The agent can call several tools, join the results and return only the part it
 needs. That is the point: the whole result set never has to pass through the
 model's context.
 
-The interpreter has no `fetch`, no `process`, no filesystem and no imports. Its
-only way out is a tool call, which enters the trusted runtime where your
+The interpreter has no `fetch`, no `process`, no filesystem, no timers and no
+imports. Its only way out is a tool call, which enters the trusted runtime where your
 credentials live. Limits are cooperative, not process isolation. Discovery is
 not cached across changes, so run `tools.search` again in a new `execute` after
 you add or reconfigure an app.
 
 Some limits are fixed by the server and a client cannot raise them: 65,536
 characters of program source, 100 tool calls, 5 minutes, and 65,536 bytes of
-output.
+output. Time spent waiting for your approval or input does not count toward the
+5 minutes. Execute returns the result when the program ends, or sooner with a
+request for approval or input when the program pauses. An MCP client with a
+shorter tool-call timeout, often 60 seconds, may give up and cancel the program.
 
 ## Signing in from the browser
 

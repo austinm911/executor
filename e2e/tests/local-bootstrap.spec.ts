@@ -151,6 +151,8 @@ const packagedCli = (options: {
         readonly env?: Readonly<Record<string, string>>;
         /** A replaced key that must now be refused. */
         readonly previousKey?: string;
+        /** Run against the ready server on its port before it stops. */
+        readonly during?: (port: number) => Effect.Effect<void, unknown, never>;
       } = {},
     ) =>
       Effect.scoped(
@@ -202,6 +204,7 @@ const packagedCli = (options: {
             );
             expect(previous.status).toBe(401);
           }
+          if (options.during !== undefined) yield* options.during(port);
           return { stdout: yield* Ref.get(stdout), stderr: yield* Ref.get(stderr) };
         }),
       );
@@ -220,24 +223,27 @@ const packagedCli = (options: {
           return { code: Number(code), message };
         }),
       );
-    /** Run `executor rotate-key` to exit and return its exit code and output. */
-    const rotate = (directory: string, env: Readonly<Record<string, string>> = {}) =>
-      Effect.scoped(
-        Effect.gen(function* () {
-          const port = yield* freePort;
-          const child = yield* processes.spawn(command(directory, port, env, "rotate-key"));
-          const [code, stdout, stderr] = yield* Effect.all(
-            [
-              child.exitCode,
-              child.stdout.pipe(Stream.decodeText, Stream.mkString),
-              child.stderr.pipe(Stream.decodeText, Stream.mkString),
-            ],
-            { concurrency: 3 },
-          );
-          return { code: Number(code), stdout, stderr };
-        }),
-      );
-    return { start, refuse, rotate, readRecord };
+    /** Run one subcommand to exit and return its exit code and output. */
+    const finish =
+      (subcommand: string) =>
+      (directory: string, env: Readonly<Record<string, string>> = {}, serverPort?: number) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const port = serverPort ?? (yield* freePort);
+            const child = yield* processes.spawn(command(directory, port, env, subcommand));
+            const [code, stdout, stderr] = yield* Effect.all(
+              [
+                child.exitCode,
+                child.stdout.pipe(Stream.decodeText, Stream.mkString),
+                child.stderr.pipe(Stream.decodeText, Stream.mkString),
+              ],
+              { concurrency: 3 },
+            );
+            return { code: Number(code), stdout, stderr };
+          }),
+        );
+    // Without a server port, `pair` is given a free port: reaching it shows the key was read.
+    return { start, refuse, rotate: finish("rotate-key"), pair: finish("pair"), readRecord };
   });
 
 it.live(scenarios.localBootstrap.title, () =>
@@ -777,6 +783,93 @@ it.live(scenarios.localBootstrapRotation.title, () =>
       expect(supplied.code).toBe(1);
       expect(supplied.stderr).toContain("are never stored");
       expect(yield* readKeys(file)).toEqual(after);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer), Effect.provide(FetchHttpClient.layer)),
+);
+
+it.live(scenarios.localBootstrapPair.title, () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "executor-pair-e2e-" });
+      const cli = yield* packagedCli({
+        keys: ["PATH", "HOME", "USERPROFILE", "SystemRoot", "APPDATA", "LOCALAPPDATA"],
+        nodeArgs: yield* standInKeyring(root),
+      });
+      const storeFile = path.join(root, "stand-in-store.json");
+      const as = (mode: string) => ({
+        EXECUTOR_E2E_STAND_IN: mode,
+        EXECUTOR_E2E_STAND_IN_FILE: storeFile,
+      });
+      const noServer = "No server answered on 127.0.0.1:";
+      /** The record and the stand-in store, which pairing must leave as they were. */
+      const saved = (directory: string) =>
+        Effect.all([
+          fs.readFileString(path.join(directory, "installation.json")),
+          fs.readFileString(storeFile),
+          fs.exists(path.join(directory, "keys.json")),
+        ]);
+      const record = (directory: string, state: string) =>
+        Effect.gen(function* () {
+          yield* fs.makeDirectory(directory);
+          yield* fs.writeFileString(
+            path.join(directory, "installation.json"),
+            JSON.stringify({ version: 1, id: crypto.randomUUID(), state }),
+          );
+        });
+
+      // A directory that keeps its keys in the OS store sends the key saved there, which its
+      // running server accepts.
+      const ready = path.join(root, "ready");
+      yield* cli.start(ready, {
+        env: as("granted"),
+        during: (port) =>
+          Effect.gen(function* () {
+            const before = yield* saved(ready);
+            const paired = yield* cli.pair(ready, as("granted"), port);
+            expect(paired.code, paired.stderr).toBe(0);
+            expect(paired.stdout.trim()).toMatch(
+              new RegExp(`^http://127\\.0\\.0\\.1:${port}/#pair=[a-f0-9]{64}$`, "u"),
+            );
+            expect(yield* saved(ready)).toEqual(before);
+          }),
+      });
+      const before = yield* saved(ready);
+      expect(before[2]).toBe(false);
+      const read = yield* cli.pair(ready, as("granted"));
+      expect(read.code).toBe(1);
+      expect(read.stderr).toContain(noServer);
+      expect(yield* saved(ready)).toEqual(before);
+
+      // Denied store access is reported, and pairing never falls back to a key file.
+      const denied = yield* cli.pair(ready, as("denied"));
+      expect(denied.code).toBe(1);
+      expect(denied.stderr).toContain("Access to the OS credential store was denied");
+      expect(denied.stderr).toContain("Nothing was changed.");
+      expect(yield* saved(ready)).toEqual(before);
+      const absent = yield* cli.pair(ready, as("absent"));
+      expect(absent.code).toBe(1);
+      expect(absent.stderr).toContain("OS credential store could not be found");
+      expect(yield* saved(ready)).toEqual(before);
+
+      // A credential missing from the store is reported and never replaced.
+      const lost = path.join(root, "lost");
+      yield* record(lost, "ready");
+      const lostBefore = yield* saved(lost);
+      const missing = yield* cli.pair(lost, as("granted"));
+      expect(missing.code).toBe(1);
+      expect(missing.stderr).toContain("OS credential is missing");
+      expect(yield* saved(lost)).toEqual(lostBefore);
+
+      // A first start that never finished has no keys to send, and its record stays pending.
+      const pending = path.join(root, "pending");
+      yield* record(pending, "pending");
+      const pendingBefore = yield* saved(pending);
+      const unfinished = yield* cli.pair(pending, as("granted"));
+      expect(unfinished.code).toBe(1);
+      expect(unfinished.stderr).toContain(`${pending} has no saved keys`);
+      expect(yield* saved(pending)).toEqual(pendingBefore);
     }),
   ).pipe(Effect.provide(NodeServices.layer), Effect.provide(FetchHttpClient.layer)),
 );

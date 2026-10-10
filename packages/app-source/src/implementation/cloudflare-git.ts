@@ -20,6 +20,7 @@ import {
   SourceCommit,
   sourceFiles,
   sourceFits,
+  removedPaths,
   type RepositoryBackend,
 } from "@executor-js/sdk/core";
 
@@ -475,6 +476,28 @@ export const cloudflareRepositories = (
                   noTags: true,
                 }),
               );
+            // The push moves the branch only from `expected`, so a clone that found another head
+            // or none is already stale. Otherwise its tree holds the files this save replaces.
+            const previous: string[] = [];
+            if (input.expected !== null) {
+              const head = yield* Effect.tryPromise({
+                try: () =>
+                  Git.resolveRef({ ...options, ref: `refs/remotes/origin/${input.branch}` }),
+                catch: (cause) =>
+                  cause instanceof Git.Errors.NotFoundError
+                    ? new SourceError({ reason: "conflict" })
+                    : failure(cause),
+              });
+              if (head !== input.expected) return yield* new SourceError({ reason: "conflict" });
+              const paths = (oid: string, prefix: string): Effect.Effect<void, SourceError> =>
+                Effect.gen(function* () {
+                  const tree = yield* gitCall(() => Git.readTree({ ...options, oid }));
+                  for (const entry of tree.tree)
+                    if (entry.type === "tree") yield* paths(entry.oid, `${prefix}${entry.path}/`);
+                    else previous.push(`${prefix}${entry.path}`);
+                });
+              yield* paths(input.expected, "");
+            }
             const writeTree = (prefix: string): Effect.Effect<string, SourceError> =>
               Effect.gen(function* () {
                 const entries: Git.TreeEntry[] = [];
@@ -568,10 +591,14 @@ export const cloudflareRepositories = (
                 }),
               ),
             );
-            return commit;
+            return { commit, removed: removedPaths(previous, files) };
           }),
         ).pipe(
-          Effect.flatMap(Schema.decodeUnknownEffect(SourceCommit)),
+          Effect.flatMap(({ commit, removed }) =>
+            Schema.decodeUnknownEffect(SourceCommit)(commit).pipe(
+              Effect.map((commit) => ({ commit, removed })),
+            ),
+          ),
           Effect.mapError(failure),
           Effect.tapError(observeFailure),
         );

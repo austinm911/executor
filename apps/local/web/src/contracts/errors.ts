@@ -3,10 +3,11 @@ import type { LocalAppManagementApi } from "@executor-js/local-server/app-manage
 import type { LocalWebhookSetupApi } from "@executor-js/local-server/webhook-setup";
 import type { DashboardApi } from "@executor-js/local-server/contracts";
 import type { AccountConnectApi } from "@executor-js/local-server/account-connections";
-import type { AccountId } from "@executor-js/sdk";
+import { mayHaveWrittenFailure, type AccountId } from "@executor-js/sdk";
 import { Cause, Match, Option, type Schema } from "effect";
 import type { HttpApiEndpoint, HttpApiGroup } from "effect/http-api";
 import type { HttpClientError } from "effect/http";
+import { pageOutdated } from "@executor-js/dashboard-start/build-change";
 import type { Sse } from "effect/encoding";
 import type { LiveConnectionLost } from "./api.ts";
 import type { ToolCatalogChanged } from "@executor-js/local-server/contracts";
@@ -33,8 +34,12 @@ export interface FailureMessage {
   readonly account?: AccountId;
 }
 const message = (title: string, description: string): FailureMessage => ({ title, description });
+/** A page from a previous build fails against the upgraded server; reloading is the fix. */
+const outdated = () => message("Executor was updated", "Reload this page to use the new version.");
 const unavailable = () =>
-  message("Could not reach Executor", "Check that the local server is running, then retry.");
+  pageOutdated()
+    ? outdated()
+    : message("Could not reach Executor", "Check that the local server is running, then retry.");
 const errorMessage = Match.type<DashboardError>().pipe(
   Match.tagsExhaustive({
     SkillRevisionChanged: () => ({
@@ -119,6 +124,16 @@ const errorMessage = Match.type<DashboardError>().pipe(
             "Source unavailable",
             "The app source could not be saved or loaded. Check its files and try again.",
           ),
+    SourcePathConflict: ({ file, nested }) =>
+      message(
+        "File and folder share a path",
+        `${file} is a file, so ${nested} cannot be inside it. Rename or remove one, then save again.`,
+      ),
+    SourcePathNotUnicode: ({ path }) =>
+      message(
+        "File path is not valid Unicode",
+        `The file path ${JSON.stringify(path)} is not valid Unicode. Rename the file, then save again.`,
+      ),
     AppNotFound: () =>
       message(
         "App not found",
@@ -195,11 +210,7 @@ const errorMessage = Match.type<DashboardError>().pipe(
         "Tool changed",
         "This tool changed between a query and a mutation. Reload the app’s tools and try again.",
       ),
-    InputInvalid: () =>
-      message(
-        "Check the input",
-        "The input does not match this tool’s schema. The tool did not run.",
-      ),
+    InputInvalid: () => message("Check the input", "The input does not match this tool’s schema."),
     ToolCallFailed: () =>
       message("The tool failed", "It may have already made changes. Check before trying again."),
     ToolBlocked: (error) => message(error.title, `${error.description} ${error.recovery.action}`),
@@ -211,10 +222,7 @@ const errorMessage = Match.type<DashboardError>().pipe(
     ToolRunApprovalRefused: (error) =>
       message(error.title, `${error.description} ${error.recovery.action}`),
     ToolPolicyFailed: () =>
-      message(
-        "Approval policy failed",
-        "The tool’s approval policy could not be evaluated. The tool did not run.",
-      ),
+      message("Approval policy failed", "The tool’s approval policy could not be evaluated."),
     ToolElicitationFailed: ({ reason }) =>
       message(
         "The tool needed more input",
@@ -265,10 +273,12 @@ const errorMessage = Match.type<DashboardError>().pipe(
     CatalogImportFailed: (error) => message("App could not be imported", error.reason),
     HttpClientError: unavailable,
     SchemaError: () =>
-      message(
-        "Unexpected server response",
-        "Check that the dashboard and server use the same version, then retry.",
-      ),
+      pageOutdated()
+        ? outdated()
+        : message(
+            "Unexpected server response",
+            "Check that the dashboard and server use the same version, then retry.",
+          ),
     LiveConnectionLost: unavailable,
     NoSuchElementError: unavailable,
     Retry: unavailable,
@@ -306,9 +316,18 @@ export const connectionLinkRecovery = Match.type<DashboardError>().pipe(
   }),
   Match.orElse(() => undefined),
 );
-/** Unexpected defects receive safe copy without printing arbitrary cause values. */
+/**
+ * Unexpected defects receive safe copy without printing arbitrary cause values. A failed call that
+ * may have written shows the presentation every surface shows for it, with the write warning as its
+ * action, instead of the fixed copy above, which may advise another call.
+ */
 export const failureMessage = (cause: Cause.Cause<DashboardError>): FailureMessage =>
   Option.match(Cause.findErrorOption(cause), {
-    onSome: errorMessage,
+    onSome: (error) => {
+      const written = mayHaveWrittenFailure(error);
+      return written === undefined
+        ? errorMessage(error)
+        : message(written.title, `${written.description} ${written.recovery.action}`);
+    },
     onNone: () => message("Something went wrong", "The request did not finish. Try again."),
   });

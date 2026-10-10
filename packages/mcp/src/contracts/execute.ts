@@ -5,6 +5,7 @@ import { HttpServerRequest } from "effect/http";
 import { McpSchema, Tool as McpTool } from "effect/ai";
 import { ApiErrorResponse, ElicitationResponse } from "apps/contracts";
 import { UserFacingError } from "@executor-js/utils/user-facing-error";
+import { ToolName } from "@executor-js/sdk/core";
 import { InteractionId, PendingInteraction, ElicitationResponseInvalid } from "./interactions.ts";
 export * from "./interactions.ts";
 import { NativeElicitationFailed } from "./elicitation.ts";
@@ -81,6 +82,144 @@ export const AppDiscoveryTimedOut = UserFacingError.define({
   }),
 });
 
+/**
+ * A call that needs approval made a request larger than the output budget, measured on what its
+ * delivery sends: the whole request as an execute result, or only the prompt a native client
+ * shows. Executor never offers it and cancels the saved call, so no one is asked to approve a call
+ * whose request did not reach them and it can never run. App code asks for approval after it has
+ * run, so the copy says what Executor did with the call, never that the tool did not run.
+ */
+export const ApprovalTooLarge = UserFacingError.define({
+  tag: "ApprovalTooLarge",
+  status: 413,
+  fields: { tool: ToolName, bytes: Schema.Int, limit: Schema.Int },
+  recorded: ({ bytes, limit }) =>
+    `Approval request of ${bytes} bytes is over the ${limit}-byte limit`,
+  presentation: ({ tool, bytes, limit }) => ({
+    title: "Approval request too large",
+    description: `The approval request for “${tool}” is ${bytes} bytes, over the ${limit}-byte limit for an approval request, so Executor did not ask for approval and will not run the call.`,
+    recovery: {
+      action:
+        "Make the arguments smaller, for example by passing large content as a URL or an uploaded file, then call the tool again.",
+      instructions: `An approval request carries the call's arguments and must fit in ${limit} bytes of JSON; this one is ${bytes}. Calling it again with the same arguments fails the same way, and changing unrelated arguments does not help. Pass large content by reference instead of inline: a URL, an upload or file ID the tool accepts, or several smaller calls if the tool supports that. Code that ran before approval was requested, in this tool or earlier in the program, may already have made changes; check current state with a safe read before calling again.`,
+    },
+  }),
+});
+export type ApprovalTooLarge = typeof ApprovalTooLarge.Type;
+
+/**
+ * Executor will not run an approved call, for a reason only its own state establishes. App code
+ * asks for approval after it has already run, so the copy says what Executor did with the saved
+ * call, never that the tool did not run. A call that ran and failed reports its own error instead.
+ */
+export const ApprovalUnavailable = UserFacingError.define({
+  tag: "ApprovalUnavailable",
+  status: 409,
+  fields: {
+    /**
+     * `expired`: the request passed its deadline. `context-changed`: Executor read the app
+     * deployment, profile or accounts and they differ from the reviewed call.
+     * `context-unconfirmed`: Executor's storage failed while it read them, so it could not compare.
+     * `answered`: another answer already claimed it. `ended`: the execution ended before the
+     * request could be saved.
+     */
+    reason: Schema.Literals([
+      "expired",
+      "context-changed",
+      "context-unconfirmed",
+      "answered",
+      "ended",
+    ]),
+  },
+  recorded: ({ reason }) => `Approval unavailable: ${reason}`,
+  presentation: ({ reason }) => {
+    const check =
+      "Code that ran before approval was requested, in this tool or earlier in the program, may already have made changes; check current state with a safe read before running anything again.";
+    switch (reason) {
+      case "expired":
+        return {
+          title: "Approval expired",
+          description:
+            "This approval request expired before it was answered, so Executor did not resume the saved call.",
+          recovery: {
+            action: "Run the call again and ask for approval promptly if it is still wanted.",
+            instructions: `Approval requests expire after 15 minutes. ${check} Then start a new execute and ask the user to approve its new request.`,
+          },
+        };
+      case "context-changed":
+        return {
+          title: "Approved call changed",
+          description:
+            "The app deployment, profile or accounts changed after this call was saved for approval, so Executor did not resume it.",
+          recovery: {
+            action: "Run the call again to review it with the current settings.",
+            instructions: `Executor resumes only the exact call that was reviewed, and its settings changed while it waited. ${check} Then start a new execute and ask the user to approve its new request.`,
+          },
+        };
+      case "context-unconfirmed":
+        return {
+          title: "Approved call not confirmed",
+          description:
+            "Executor could not read the app deployment, profile or accounts to confirm they still match the reviewed call, because its own storage failed, so it did not resume the call. Nothing shows that they changed.",
+          recovery: {
+            action:
+              "Try again in a moment: run the call again and approve its new request. If this continues, check Executor's storage.",
+            instructions: `This was a failure of Executor's storage, not a change to the call. The approval request is used up, so resuming it again will not run it. ${check} Then start a new execute and ask the user to approve its new request; if storage keeps failing, report it to whoever runs this Executor.`,
+          },
+        };
+      case "answered":
+        return {
+          title: "Approval already answered",
+          description:
+            "This approval request was already answered elsewhere, which claimed its saved call, so Executor did not run the call again. That call may still be running, and its outcome is not replayed here.",
+          recovery: {
+            action:
+              "Check the response to the earlier answer, if you have it, and the current state before running anything again.",
+            instructions: `Each approval request is answered once. The earlier answer may not have received a result yet, or its response may have been lost. ${check}`,
+          },
+        };
+      case "ended":
+        return {
+          title: "Execution ended",
+          description:
+            "The execution ended while this tool was asking for approval, so Executor will not resume the call.",
+          recovery: {
+            action: "Check current state, then run the program again if it is still needed.",
+            instructions: `The execution timed out or was cancelled before the approval request could be saved. ${check}`,
+          },
+        };
+    }
+  },
+});
+export type ApprovalUnavailable = typeof ApprovalUnavailable.Type;
+
+/**
+ * Why a resume found no request it could answer. Executor's own record of the request decides it;
+ * a request issued to another caller is indistinguishable from an unknown one.
+ */
+export const ResumeUnavailableReason = Schema.Literals([
+  "answered",
+  "expired",
+  "ended",
+  "not-found",
+]);
+export type ResumeUnavailableReason = typeof ResumeUnavailableReason.Type;
+/** The guidance a resume returns with each reason. */
+export const resumeUnavailableMessage = (reason: ResumeUnavailableReason): string => {
+  const check =
+    "Earlier calls in the program, and code a tool ran before asking for approval, may already have made changes: check current state with a safe read before starting a new execute, and never rerun the program automatically.";
+  switch (reason) {
+    case "answered":
+      return `This request was already answered by another resume, which claimed it. Executor does not run it again or replay its outcome here: that program may still be running, and its result goes only to the resume that answered it, if that response arrived. Do not resume it again. ${check}`;
+    case "expired":
+      return `This request expired before it was answered, so Executor will not resume its program. ${check}`;
+    case "ended":
+      return `The program that asked this ended before it was answered: it was cancelled, timed out, or stopped. Executor will not resume it. ${check}`;
+    case "not-found":
+      return `Executor has no pending request with this ID for this caller. It may belong to another grant, scoped connection or approval mode; it may have ended or been answered long enough ago that Executor no longer remembers it; or it was lost when Executor restarted. In model mode, a new MCP session on the same grant can still answer its requests. ${check}`;
+  }
+};
+
 /** Generated code is bounded before it reaches the parser. */
 export const ExecuteInput = Schema.Struct({
   code: Schema.String.check(Schema.isMaxLength(defaultMcpRuntimeLimits.maxCodeChars)),
@@ -109,6 +248,17 @@ export const McpToolCall = Schema.Struct({
   durationMs: Schema.optionalKey(Schema.Number),
 });
 export type McpToolCall = typeof McpToolCall.Type;
+/**
+ * A failed tool's curated explanation as an agent receives it; a program can read it from a
+ * caught tool error. `retryable` means an unchanged repeat may help and is considered safe. It
+ * does not guarantee success, and correcting the input, configuration or access may allow a new
+ * attempt even when it is false.
+ */
+export const McpErrorResponse = Schema.Struct({
+  ...ApiErrorResponse.fields,
+  retryable: Schema.Boolean,
+});
+export type McpErrorResponse = typeof McpErrorResponse.Type;
 /** Program result plus apps that could not expose a live catalog during this execution. */
 export const ExecuteResult = Schema.Struct({
   execution: Schema.Union([
@@ -117,7 +267,7 @@ export const ExecuteResult = Schema.Struct({
       ...CodeMode.Failure.fields,
       error: Schema.Struct({
         ...CodeMode.Diagnostic.fields,
-        response: Schema.optionalKey(ApiErrorResponse),
+        response: Schema.optionalKey(McpErrorResponse),
       }),
       toolCalls: Schema.Array(McpToolCall),
     }),
@@ -127,7 +277,12 @@ export const ExecuteResult = Schema.Struct({
 /** MCP execution may return a live pause; completed program results retain the existing fields. */
 export const ExecutionOutcome = Schema.Union([
   Schema.Struct({ status: Schema.Literal("completed"), ...ExecuteResult.fields }),
-  Schema.Struct({ status: Schema.Literal("unavailable"), requestId: InteractionId }),
+  Schema.Struct({
+    status: Schema.Literal("unavailable"),
+    requestId: InteractionId,
+    reason: ResumeUnavailableReason,
+    message: Schema.String,
+  }),
   Schema.Struct({ status: Schema.Literal("busy"), requestId: InteractionId }),
   Schema.Struct({ status: Schema.Literal("capacity-exceeded") }),
 ]);
@@ -142,7 +297,7 @@ export const ResumeInput = Schema.Struct({
 /** Continue an existing program after the agent has obtained the user's decision. Never restarts source. */
 export const ResumeTool = McpTool.make("resume", {
   description:
-    "Continue a paused execute program using its pending requestId and the user's MCP elicitation response: {action: 'accept', content: {...}}, {action: 'decline'}, or {action: 'cancel'}. Ask the user before approving. Return the user's form fields in content on accept. Returns the next pending interaction or the completed program result. An unavailable continuation may have expired, been consumed, or been lost on restart; do not rerun the whole program because earlier calls may have completed. Busy means another resume is advancing this program; wait for that response. Results are not replayed.",
+    "Continue a paused execute program using its pending requestId and the user's MCP elicitation response: {action: 'accept', content: {...}}, {action: 'decline'}, or {action: 'cancel'}. Ask the user before approving. Return the user's form fields in content on accept. Returns the next pending interaction or the completed program result. An approved call that fails reports its own error. Unavailable carries a reason (answered, expired, ended or not-found) and what to do; do not rerun the whole program because earlier calls may have completed. Busy means another resume is advancing this program; wait for that response. Results are not replayed.",
   dependencies: [HttpServerRequest.HttpServerRequest],
   parameters: ResumeInput,
   success: McpExecutionResult,

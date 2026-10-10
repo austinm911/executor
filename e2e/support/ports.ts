@@ -1,13 +1,16 @@
 /** Scoped loopback listeners for isolated ports and real bind-conflict fixtures. */
-import { createServer } from "node:net";
+import { createServer, type Socket } from "node:net";
 import { Effect } from "effect";
 import { driver } from "./platform.ts";
 
-/** Hold a loopback port until the owning scope closes; zero asks the OS to choose. */
-export const holdPort = (port: number) =>
+/**
+ * Hold a loopback port until the owning scope closes; zero asks the OS to choose. `onConnection`
+ * handles each connection; the scope closes once every connection has ended.
+ */
+export const holdPort = (port: number, onConnection?: (socket: Socket) => void) =>
   Effect.gen(function* () {
     const server = yield* Effect.acquireRelease(
-      Effect.sync(() => createServer()),
+      Effect.sync(() => createServer(onConnection)),
       (server) =>
         Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve()))),
     );

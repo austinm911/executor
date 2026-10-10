@@ -400,6 +400,9 @@ const saved = await executor.appManagement.commit({
   path,
   body: { expected: source.revision.commit, message: "Update greeting", files },
 });
+if (saved.removed.count > 0) {
+  throw new Error(`The save removed ${saved.removed.count} files: ${saved.removed.paths.join(", ")}`);
+}
 return await executor.appManagement.deploy({
   path,
   body: { commit: saved.revision.commit },
@@ -407,6 +410,11 @@ return await executor.appManagement.deploy({
 ```
 
 The commit replaces the complete file list, so keep `package.json` in it.
+Its result's `removed` gives the `count` of files it deleted and at most 100
+of their `paths`; check it before deploying. A deleted file is still in `source.files`
+and in the `expected` commit, so add it back and commit again to keep it. A
+path cannot be both a file and a folder; such a save fails with
+`SourcePathConflict` and saves nothing.
 Saving source does not deploy it.
 Web pages show source; agents or ordinary Git clients edit it.
 
@@ -470,8 +478,9 @@ return await tools.executor.profiles["<management-profile-id>"].appUi.location({
 
 Open the returned `url` in a browser. Executor Cloud uses
 `https://<app-slug>.<org-slug>.executor.website`; self-host uses its configured
-app domain. Use the returned URL instead of guessing it. A null URL means the
-app has no UI or the host has no app domain configured.
+app domain. Use the returned URL instead of guessing it. A null URL with
+`status: "unavailable"` gives a `reason`: `"no_ui"` when the app has no UI, or
+`"no_app_domain"` when the host has no app domain configured.
 
 App pages are private. Opening the link starts browser sign-in through Executor.
 A successful tool call or a `403` from a guessed address does not verify that

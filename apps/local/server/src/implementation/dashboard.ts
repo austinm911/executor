@@ -526,7 +526,8 @@ export const dashboard = (
               status: "approval-required",
               requestId: params.requestId,
               invocation,
-              // Built from the saved call, so the prompt shows exactly what approval resumes.
+              // Built from the saved call, so it describes what approval resumes; the review card
+              // shows the exact arguments from the invocation.
               elicitation: approvalElicitation(invocation.tool, invocation.input),
               expiresAt,
             },

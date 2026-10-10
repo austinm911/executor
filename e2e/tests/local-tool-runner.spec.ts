@@ -15,6 +15,7 @@ import { Browser } from "../support/browser.ts";
 import { TestLive, withCase } from "../support/case.ts";
 import { Target } from "../support/platform.ts";
 import { scenarios } from "../test-plan.ts";
+import { unknownOutcomeAction } from "../support/write-outcome.ts";
 
 /** The runner's Form and JSON tabs, apart from the schema viewer's own JSON tabs. */
 const formatTab = (page: Page, name: "Form" | "JSON") =>
@@ -250,9 +251,23 @@ layer(TestLive, { excludeTestServices: true })("Local tool runner", (it) => {
             .fill("fail")
             .then(() => page.getByRole("button", { name: "Run tool", exact: true }).click()),
         );
-        yield* browser.use("The failure is explained", (page) =>
-          page.getByText("The tool failed", { exact: true }).waitFor(),
+        // The notice names the app's own error and what to do, not a generic failure.
+        const notice = yield* browser.use("The failure is explained", (page) =>
+          page
+            .getByText("The app’s tool failed", { exact: true })
+            .waitFor()
+            .then(() => page.getByRole("alert").textContent()),
         );
+        expect(notice).toContain("The app threw Error: Synthetic tool failure");
+        expect(notice).toContain(
+          "Read the error to determine whether input, app code, configuration or Executor needs attention.",
+        );
+        // The form's own Run tool button repeats the call; the notice adds no Try again.
+        expect(
+          yield* browser.use("The notice adds no Try again of its own", (page) =>
+            page.getByRole("button", { name: "Try again", exact: true }).count(),
+          ),
+        ).toBe(0);
         expect(
           yield* browser.use("The failed call keeps its input and drops the old result", (page) =>
             Promise.all([
@@ -625,11 +640,12 @@ layer(TestLive, { excludeTestServices: true })("Local tool runner", (it) => {
               ]),
             ),
         );
-        // The dashboard names the tool and says how the call could be allowed, not only its tag.
+        // The dashboard names the tool, not only its tag. The policy is the app's code and ran after
+        // the app received the mutation, so the refusal leads with the instruction not to repeat it.
         expect(denied).toEqual([
           [
             "The approval policy in the app’s code denied this call to “blocked”.",
-            "Check what the app’s approval policy requires for this tool. If the call should be allowed, meet those requirements or, with the user’s agreement, change the policy and deploy it. Otherwise use a different tool.",
+            unknownOutcomeAction,
           ],
           0,
         ]);

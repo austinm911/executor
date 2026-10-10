@@ -50,7 +50,7 @@ export const installExecutorApp = (executor: Executor, config: ServerConfig) =>
     const account =
       typeof selected === "string"
         ? yield* executor.accounts.get({ account: selected })
-        : yield* executor.accounts.add({
+        : yield* executor.managedAccounts.add({
             owner,
             provider: requirement.provider,
             method: "apiKey",
@@ -59,7 +59,7 @@ export const installExecutorApp = (executor: Executor, config: ServerConfig) =>
           });
     if (account.provider !== requirement.provider) return yield* Effect.fail(new StorageError());
     // Update the host-owned connection in place when its configured port/key changes; keep the account ID stable.
-    yield* executor.accounts.replaceCredentials({ owner, account: account.id, fields });
+    yield* executor.managedAccounts.replaceCredentials({ owner, account: account.id, fields });
     const saved =
       profile === null
         ? yield* executor.apps.profiles.create({

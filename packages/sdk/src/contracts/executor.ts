@@ -27,17 +27,18 @@ import type {
 import type { BlobStorage } from "./blobs.ts";
 import { RepositoryHost, type RepositoryBackend } from "./source.ts";
 import type { RegistryOptions } from "./registry.ts";
+import type { CatalogReadOptions } from "./declarations.ts";
 
 /** The connection being completed, with what the product needs to recheck without reading SDK tables. */
 export interface AccountConnectionCompletion {
   readonly id: AccountConnectionId;
   readonly owner: import("./shared.ts").OwnerId;
   readonly reconnectAccount: import("./shared.ts").AccountId | null;
-  /** The profile the connection targets, as stored now; null for a plain account connection. */
+  /** The profile the connection targets, as stored now. */
   readonly target: {
     readonly app: import("./shared.ts").AppId;
     readonly profile: import("./profiles.ts").Profile;
-  } | null;
+  };
 }
 /** Product metadata participates in the resource transaction; hooks must perform no external I/O. */
 export interface ResourceLifecycle {
@@ -171,8 +172,8 @@ type Groups<Api> = Api extends HttpApi.HttpApi<infer _Id, infer G> ? G : never;
 type WithInvocationOptions<M> = M extends (input: infer Input) => infer Output
   ? (input: Input, options?: ToolInvocationOptions) => Output
   : M;
-type WithListOptions<M> = M extends (input: infer Input) => infer Output
-  ? (input: Input, options?: ToolListOptions) => Output
+type WithListOptions<M, Options> = M extends (input: infer Input) => infer Output
+  ? (input: Input, options?: Options) => Output
   : M;
 
 /**
@@ -189,9 +190,13 @@ type FlatExecutor = {
       ? HttpApiEndpoint.Identifier<E> extends "call" | "resume"
         ? WithInvocationOptions<Method<E>>
         : HttpApiEndpoint.Identifier<E> extends "list"
-          ? WithListOptions<Method<E>>
+          ? WithListOptions<Method<E>, ToolListOptions>
           : Method<E>
-      : Method<E>;
+      : HttpApiGroup.Identifier<G> extends "skills"
+        ? HttpApiEndpoint.Identifier<E> extends "list"
+          ? WithListOptions<Method<E>, CatalogReadOptions>
+          : Method<E>
+        : Method<E>;
   };
 };
 
@@ -223,6 +228,11 @@ export type Executor = Omit<
   readonly scheduler: import("./scheduler.ts").ScheduleDispatcher;
   /** Host-only: products authorize every event operation before calling it. */
   readonly events: import("./events.ts").ExecutorEvents;
+  /**
+   * Host-only: credential writes for accounts the product provisions itself, such as its own API
+   * access. Everyone else saves credentials through an app's connection request.
+   */
+  readonly managedAccounts: import("./account.ts").ManagedAccounts;
 };
 
 type Promisify<T> = T extends (...args: infer Args) => Effect.Effect<infer A, infer _E, never>
@@ -239,6 +249,7 @@ export type PromiseExecutor = Promisify<
     | typeof StorageHost
     | "scheduler"
     | "events"
+    | "managedAccounts"
     | "tools"
   > & { readonly tools: Omit<Executor["tools"], "approval"> }
 >;

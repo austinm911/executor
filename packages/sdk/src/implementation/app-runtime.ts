@@ -29,6 +29,7 @@ import {
 } from "apps/contracts";
 import {
   AppCacheChanges,
+  AppCodeEntered,
   DispatchTiming,
   AppEventSink,
   InvocationRun,
@@ -175,31 +176,31 @@ export const appRuntime = (host: AppRuntimeHost) =>
           // Only the trusted runner or data supervisor calls the loader. The runner may sit behind
           // RPC, so the loader keeps an unsupported protocol as this call's typed failure.
           const loader = yield* invocationBuildLoader(invocation, host.loadBuild(build));
+          const capabilities: AppCapabilities = {
+            load: loader.load,
+            elicit:
+              input.elicitation === undefined
+                ? null
+                : invocationElicitation(input.elicitation, lifetime.signal),
+            controls:
+              input.workflowControls === undefined
+                ? null
+                : yield* invocationWorkflowControls(input.workflowControls, lifetime.signal),
+            ...(input.workflow === undefined ? {} : { workflow: input.workflow }),
+          };
           const from = yield* Clock.currentTimeNanos;
-          const body = yield* loader
-            .refused(
-              host.invoke(invocation, {
-                load: loader.load,
-                elicit:
-                  input.elicitation === undefined
-                    ? null
-                    : invocationElicitation(input.elicitation, lifetime.signal),
-                controls:
-                  input.workflowControls === undefined
-                    ? null
-                    : yield* invocationWorkflowControls(input.workflowControls, lifetime.signal),
-                ...(input.workflow === undefined ? {} : { workflow: input.workflow }),
-              }),
-            )
-            .pipe(
-              Effect.ensuring(
-                Effect.flatMap(Clock.currentTimeNanos, (to) =>
-                  Effect.sync(() => {
-                    invoked = [from, to];
-                  }),
-                ),
+          // Recorded here, by the host, before the runner receives the invocation: whatever it
+          // reports afterwards came through code the app controls.
+          (yield* AppCodeEntered).entered();
+          const body = yield* loader.refused(host.invoke(invocation, capabilities)).pipe(
+            Effect.ensuring(
+              Effect.flatMap(Clock.currentTimeNanos, (to) =>
+                Effect.sync(() => {
+                  invoked = [from, to];
+                }),
               ),
-            );
+            ),
+          );
           // Telemetry is an additive transport field. Retained builds keep their original protocol.
           const collected = yield* Schema.decodeUnknownEffect(
             Schema.Struct({

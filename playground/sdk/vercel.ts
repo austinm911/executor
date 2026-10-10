@@ -13,7 +13,7 @@ import apps from "apps/package.json" with { type: "json" };
 
 const me = OwnerId.make("app-user-me");
 
-/** Deploy one configured app, create an account, select it, and call the tool. */
+/** Deploy one configured app, connect an account for its profile, and call the tool. */
 export async function vercelProjectsReport(executor: Executor) {
   const source = await Effect.runPromise(
     FileSystem.FileSystem.use((fs) =>
@@ -30,23 +30,27 @@ export async function vercelProjectsReport(executor: Executor) {
   });
 
   // Runtime metadata has dynamic slot names; check the expected slot exists.
-  const vercel = app.requirements.accounts.vercel;
-  if (vercel === undefined) throw new Error("This app must declare a vercel account");
-
-  const account = await executor.accounts.add({
-    owner: me,
-    provider: vercel.provider,
-    method: "apiKey",
-    label: "Work Vercel",
-    fields: { token: "vercel_tok_synthetic_example_only" },
-  });
+  if (app.requirements.accounts.vercel === undefined)
+    throw new Error("This app must declare a vercel account");
 
   const profile = await executor.apps.profiles.create({
     owner: me,
     subject: "me",
     idempotencyKey: "work",
     app: app.id,
-    accounts: { vercel: account.id },
+    accounts: {},
+  });
+  // Every account is connected for an app requirement. Completing the request saves the
+  // account and selects it for the profile. Products give users the request as a browser link.
+  const connection = await executor.accountConnections.create({
+    owner: me,
+    target: { app: app.id, profile: profile.id, requirement: "vercel" },
+  });
+  const account = await executor.accountConnections.submit({
+    connection: connection.id,
+    method: "apiKey",
+    label: "Work Vercel",
+    fields: { token: "vercel_tok_synthetic_example_only" },
   });
 
   const projects = await executor.tools.call({

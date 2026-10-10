@@ -5,8 +5,7 @@ import { randomUUID } from "node:crypto";
 import { Api, body, type Session } from "../support/api.ts";
 import { Target } from "../support/platform.ts";
 import { TestLive, withCase } from "../support/case.ts";
-import { Resource } from "../support/contracts.ts";
-import { createProfile, selectProfileAccounts } from "../support/profiles.ts";
+import { connectLocalAccount, createProfile } from "../support/profiles.ts";
 import {
   workflowFiles,
   WorkflowRun as Run,
@@ -80,23 +79,23 @@ layer(TestLive, { excludeTestServices: true })("Local workflows", (it) => {
         resources.apps.push(app.id);
         const path = `/v1/apps/${app.id}`;
         const profile = yield* createProfile(agent, path, { owner, subject: "local" });
-        const addAccount = (token: string) =>
-          Effect.gen(function* () {
-            const created = yield* api.request(agent, "POST", "/v1/accounts", {
-              owner: accountOwner,
-              provider: app.requirements.accounts.service.provider,
-              method: "key",
-              label: name,
-              fields: { token },
-            });
-            expect(created.status).toBe(200);
-            const account = (yield* body(Resource, created)).id;
-            resources.accounts.push(account);
-            expect(
-              (yield* selectProfileAccounts(agent, path, profile.id, { service: account })).status,
-            ).toBe(200);
-            return account;
+        /** Connect an account for the profile, which selects it, or replace one's key. */
+        const connect = (token: string, account?: string) =>
+          connectLocalAccount(agent, {
+            owner: accountOwner,
+            app: app.id,
+            profile: profile.id,
+            requirement: "service",
+            method: "key",
+            label: name,
+            fields: { token },
+            ...(account === undefined ? {} : { account }),
           });
+        const addAccount = (token: string) =>
+          connect(token).pipe(
+            Effect.map((connected) => connected.id),
+            Effect.tap((account) => Effect.sync(() => resources.accounts.push(account))),
+          );
         const account = yield* addAccount("synthetic-original");
         expect((yield* session.send("GET", `${path}/workflows`)).status).toBe(401);
         expect(
@@ -190,11 +189,8 @@ layer(TestLive, { excludeTestServices: true })("Local workflows", (it) => {
         expect(blockedAccountOwner.body).toMatchObject({ _tag: "AccountWorkflowsActive", account });
         expect((yield* api.request(agent, "DELETE", path)).status).toBe(409);
         expect((yield* api.request(agent, "DELETE", `/v1/accounts/${account}`)).status).toBe(409);
-        expect(
-          (yield* api.request(agent, "PUT", `/v1/accounts/${account}/credentials`, {
-            fields: { token: "synthetic-refreshed" },
-          })).status,
-        ).toBe(200);
+        // Reconnecting replaces the key while the run holds the account.
+        expect((yield* connect("synthetic-refreshed", account)).id).toBe(account);
         const second = yield* addAccount("synthetic-other");
         expect(second).not.toBe(account);
         const updated = yield* api.request(agent, "POST", "/v1/apps/deploy", {

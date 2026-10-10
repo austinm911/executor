@@ -5,7 +5,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -29,6 +31,22 @@ import (
 	"syscall"
 	"time"
 )
+
+// memoryPressureMiB is where workerd starts collecting garbage in every isolate: 60% of the
+// container's cgroup v2 memory limit, leaving room below the limit for a collection to take
+// effect before the kernel reclaims or kills. Zero, which turns the check off, when the limit
+// file is missing or says "max".
+func memoryPressureMiB(limitFile string) uint64 {
+	limit, err := os.ReadFile(limitFile)
+	if err != nil {
+		return 0
+	}
+	limitBytes, err := strconv.ParseUint(strings.TrimSpace(string(limit)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return limitBytes / 1024 / 1024 * 60 / 100
+}
 
 func setting(name, fallback string) string {
 	if value := os.Getenv(name); value != "" {
@@ -514,6 +532,17 @@ func serve(mode string) error {
 		appWorkers = strconv.Itoa(number)
 	}
 	config = bytes.ReplaceAll(config, []byte("@@APP_WORKERS@@"), []byte(appWorkers))
+	// Seconds an idle app Worker stays loaded; zero turns idle unloading off, null keeps the default.
+	appWorkerIdle := "null"
+	if value := values["EXECUTOR_APP_WORKER_IDLE_SECONDS"]; value != "" {
+		number, err := strconv.Atoi(value)
+		if err != nil || number < 0 {
+			return errors.New("EXECUTOR_APP_WORKER_IDLE_SECONDS must be a non-negative integer")
+		}
+		appWorkerIdle = strconv.Itoa(number)
+	}
+	config = bytes.ReplaceAll(config, []byte("@@APP_WORKER_IDLE_SECONDS@@"), []byte(appWorkerIdle))
+	config = bytes.ReplaceAll(config, []byte("@@MEMORY_PRESSURE_MB@@"), []byte(strconv.FormatUint(memoryPressureMiB("/sys/fs/cgroup/memory.max"), 10)))
 	config = bytes.ReplaceAll(config, []byte("@@SELF_ORIGIN@@"), []byte(strconv.Quote(values["BETTER_AUTH_URL"])))
 	// App builds install packages from this registry; empty selects the public registry.
 	registry := values["EXECUTOR_NPM_REGISTRY"]
@@ -574,7 +603,11 @@ func serve(mode string) error {
 	configureChild(command)
 	command.Stdout = os.Stderr
 	command.Stderr = os.Stderr
-	command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + temporary}
+	// The apps Worker seals credential handles with a secret derived from the encryption key, so
+	// handles survive a restart and no one else knows it. It reaches workerd only in its
+	// environment, never in the configuration file. Handles sealed under the constant earlier
+	// images used are refused after the upgrade; apps get new ones on their next invocation.
+	command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + temporary, "EXECUTOR_CREDENTIAL_HANDLE_SECRET=" + credentialHandleSecret(values["EXECUTOR_ENCRYPTION_KEY"])}
 	for _, name := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
 		if value := os.Getenv(name); value != "" {
 			command.Env = append(command.Env, name+"="+value)
@@ -663,6 +696,14 @@ func serve(mode string) error {
 		command.Process.Kill()
 		return <-stopped
 	}
+}
+
+// credentialHandleSecret derives the apps Worker's credential handle secret from the instance's
+// encryption key, as the Node host does: HMAC-SHA256 of a fixed label, in hex.
+func credentialHandleSecret(encryptionKey string) string {
+	mac := hmac.New(sha256.New, []byte(encryptionKey))
+	mac.Write([]byte("executor credential handles"))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // workerd serves HTTP with kj's default HttpServerSettings; its pipelineTimeout

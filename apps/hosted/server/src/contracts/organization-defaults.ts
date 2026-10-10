@@ -19,6 +19,8 @@ import {
   SkillDefinitionInvalid,
   StorageError,
   SourceError,
+  SourcePathConflict,
+  SourcePathNotUnicode,
 } from "@executor-js/sdk/core";
 import { TemplateError } from "@executor-js/app-templates/contracts";
 import type { OrganizationId } from "./organization.ts";
@@ -35,6 +37,8 @@ export const OrganizationDefaultsError = Schema.Union([
   OrganizationDefaultsPending,
   StorageError,
   SourceError,
+  SourcePathConflict,
+  SourcePathNotUnicode,
   TemplateError.annotate({ httpApiStatus: 422 }),
   DeploymentBuildFailed,
   BuildMemoryExceeded,

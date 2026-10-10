@@ -54,23 +54,21 @@ export function ConnectionFields({
             ? "Account connected."
             : "This connection has expired. Start a new connection from the app."}
         </p>
-        {connection.target && (
-          <Button asChild variant="outline">
-            <Link
-              to="/org/$organizationSlug/apps/$appId"
-              params={{ organizationSlug, appId: connection.target.app }}
-              search={{ view: "accounts", profile: connection.target.profile }}
-            >
-              Back to app
-            </Link>
-          </Button>
-        )}
+        <Button asChild variant="outline">
+          <Link
+            to="/org/$organizationSlug/apps/$appId"
+            params={{ organizationSlug, appId: connection.target.app }}
+            search={{ view: "accounts", profile: connection.target.profile }}
+          >
+            Back to app
+          </Link>
+        </Button>
       </>
     );
   return (
     <HostedAccountForm
       provider={connection.provider}
-      app={connection.checkable ? connection.target?.app : undefined}
+      app={connection.checkable ? connection.target.app : undefined}
       {...(connection.reconnectAccount ? { account: connection.reconnectAccount } : {})}
       redirectUri={connection.redirectUri}
       initialMethod={initialMethod}
@@ -85,8 +83,8 @@ export function ConnectionFields({
             organization,
             organizationSlug,
             connection: connection.id,
-            app: connection.target?.app ?? null,
-            profile: connection.target?.profile,
+            app: connection.target.app,
+            profile: connection.target.profile,
             redirectUri: value.redirectUri,
             ...(connection.reconnectAccount ? { reconnect: true } : {}),
             manualClient: value.manualClient,

@@ -135,6 +135,23 @@ export default defineApp({ accounts: { service } }, async () => ({ tools: router
           ],
           ["POST", `/dashboard/api/accounts/${accounts[0]}/oauth/start`, {}],
           ["POST", "/dashboard/api/accounts/oauth/start", { provider, method: "key" }],
+          // Nor can an agent save or replace credentials through the API: they go through a
+          // connection link the user completes.
+          [
+            "POST",
+            "/v1/accounts",
+            {
+              owner: "local",
+              provider,
+              method: "key",
+              fields: { token: "synthetic-local-naming-token" },
+            },
+          ],
+          [
+            "PUT",
+            `/v1/accounts/${accounts[0]}/credentials`,
+            { fields: { token: "synthetic-local-naming-token" } },
+          ],
         ] as const)
           expect((yield* session.send(method, path, payload, headers)).status, path).toBe(404);
         expect(
@@ -231,6 +248,83 @@ export default defineApp({ accounts: { service } }, async () => ({ tools: router
         );
         expect(yield* savedLabel(fromDialog.id)).toBe("Dialog key");
         yield* browser.checkpoint("Named account selected for the app");
+
+        // Every account row keeps its menu in view, not only the selected one or on hover.
+        expect(
+          yield* browser.use("Unselected accounts show their menu without hover", (page) =>
+            page.mouse
+              .move(0, 0)
+              .then(() =>
+                page
+                  .getByRole("button", { name: "Manage Supplied name", exact: true })
+                  .evaluate((element) => getComputedStyle(element).opacity),
+              ),
+          ),
+        ).toBe("1");
+        expect(
+          yield* browser.use("An unselected account's menu cannot remove it", (page) =>
+            page
+              .getByRole("button", { name: "Manage Supplied name", exact: true })
+              .click()
+              .then(() =>
+                page.getByRole("menuitem", { name: "Edit details", exact: true }).waitFor(),
+              )
+              // Let the menu finish opening so the checkpoint shows it, not its fade-in.
+              .then(() =>
+                page
+                  .getByRole("menu")
+                  .evaluate((menu) =>
+                    Promise.all(menu.getAnimations().map((animation) => animation.finished)),
+                  ),
+              )
+              .then(() => page.getByRole("menuitem").allTextContents()),
+          ),
+        ).toEqual(["Edit details", "Update credentials"]);
+        yield* browser.checkpoint("Unselected account menu");
+        yield* browser.use("Close the unselected account's menu", (page) =>
+          page.keyboard.press("Escape"),
+        );
+
+        // An unselected account's menu opens the same dialogs as a selected one.
+        const edit = yield* browser.use("Edit an unselected account's details", (page) =>
+          page
+            .getByRole("button", { name: "Manage Supplied name", exact: true })
+            .click()
+            .then(() => page.getByRole("menuitem", { name: "Edit details", exact: true }).click())
+            .then(() => page.getByRole("dialog", { name: "Edit account", exact: true }))
+            .then((dialog) => dialog.waitFor({ state: "visible" }).then(() => dialog)),
+        );
+        yield* browser.checkpoint("Edit details from an unselected account");
+        yield* browser.use("Cancel editing the details", () =>
+          edit
+            .getByRole("button", { name: "Cancel", exact: true })
+            .click()
+            .then(() => edit.waitFor({ state: "hidden" })),
+        );
+        const unselectedCredentials = yield* browser.use(
+          "Update an unselected account's credentials",
+          (page) =>
+            page
+              .getByRole("button", { name: "Manage Supplied name", exact: true })
+              .click()
+              .then(() =>
+                page.getByRole("menuitem", { name: "Update credentials", exact: true }).click(),
+              )
+              .then(() => page.getByRole("dialog", { name: "Update credentials", exact: true }))
+              .then((dialog) =>
+                dialog
+                  .getByLabel("Token", { exact: true })
+                  .waitFor({ state: "visible" })
+                  .then(() => dialog),
+              ),
+        );
+        yield* browser.checkpoint("Update credentials from an unselected account");
+        yield* browser.use("Close the credentials dialog", () =>
+          unselectedCredentials
+            .getByRole("button", { name: "Close", exact: true })
+            .click()
+            .then(() => unselectedCredentials.waitFor({ state: "hidden" })),
+        );
 
         // Credentials are replaced from the app that selects the account, through its menu.
         yield* browser.use("Update the named account's credentials", (page) =>

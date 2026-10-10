@@ -6,7 +6,7 @@ import {
   AppSlug,
   JsonObject,
   routerFailure,
-  ToolApprovalRequired,
+  approvalRequired,
   ToolListingTimedOut,
   type App,
   type AppId,
@@ -195,7 +195,8 @@ function listTools<E extends Error>(
     do {
       const page = yield* backend.listTools(
         { app, ...selection, deployment, cursor, limit: 2_000 },
-        { reportRunningAfterMillis: waitMs },
+        // Discovery reads every app's listing; refreshing aged ones would load each app's Worker.
+        { reportRunningAfterMillis: waitMs, refreshStale: false },
       );
       yield* paged;
       deployment = page.deployment;
@@ -1063,13 +1064,7 @@ function catalog(backend: McpBackend<Error>, progress: ExecutionProgress) {
                             Effect.flatMap((result) =>
                               result.status === "completed"
                                 ? Effect.succeed(result.value)
-                                : Effect.fail(
-                                    new ToolApprovalRequired({
-                                      app: result.invocation.app,
-                                      deployment: result.invocation.deployment,
-                                      tool: result.invocation.tool,
-                                    }),
-                                  ),
+                                : Effect.fail(approvalRequired(result)),
                             ),
                             Effect.mapError((error) => toolError(diagnostic(error))),
                           ),

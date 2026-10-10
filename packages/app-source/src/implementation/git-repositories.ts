@@ -7,6 +7,7 @@ import {
   SourceCommit,
   sourceFiles,
   sourceFits,
+  removedPaths,
   type RepositoryBackend,
 } from "@executor-js/sdk/core";
 import { Effect, Schema, Semaphore, type Scope } from "effect";
@@ -247,6 +248,19 @@ export const gitRepositories = (host: GitHost): RepositoryBackend => {
             bytes(input.message),
             environment,
           ).pipe(Effect.flatMap(Schema.decodeUnknownEffect(SourceCommit)));
+          // The ref moves only from `expected`, so its tree holds the files this save replaces.
+          const previous =
+            input.expected === null
+              ? []
+              : (yield* text([
+                  "--git-dir",
+                  repo,
+                  "ls-tree",
+                  "-r",
+                  "-z",
+                  "--name-only",
+                  `${input.expected}^{tree}`,
+                ])).split("\0");
           const updated = yield* git([
             "--git-dir",
             repo,
@@ -256,7 +270,7 @@ export const gitRepositories = (host: GitHost): RepositoryBackend => {
             input.expected === null ? "0".repeat(40) : input.expected,
           ]);
           if (updated.code !== 0) return yield* new SourceError({ reason: "conflict" });
-          return commit;
+          return { commit, removed: removedPaths(previous.filter(Boolean), files) };
         }),
       ).pipe(
         Effect.mapError((error) =>

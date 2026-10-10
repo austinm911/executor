@@ -3,6 +3,7 @@ export {
   CatalogEntry,
   CatalogImport,
   CatalogImportFailed,
+  CatalogRecovery,
   CatalogUnavailable,
   PreparedApp,
   quickAdd,

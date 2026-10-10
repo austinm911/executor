@@ -255,6 +255,8 @@ settings the definition cannot be trusted to decide:
 - `allowedOrigin`: the one origin that may receive credentials. `baseUrl`
   overrides the definition's server.
 - `securitySchemes`: usually `components.securitySchemes` from the definition.
+  A security alternative naming a scheme not listed here is ignored, so list
+  only the schemes `methods` or `oauth` fill.
 - `methods`: which account fields fill each scheme for each `secrets` method,
   e.g. `{ apiKey: [{ scheme: "bearerAuth", field: "token", part: "value", prefix: "" }] }`.
   Basic auth binds `username` and `password` parts.
@@ -290,11 +292,14 @@ collide. `kinds` still uses the original operationId. Discover the exact names
 with search, or before an account connects as below.
 
 Operations the helper cannot represent, and operations whose security needs
-another method, are left out rather than failing the app. Reading or calling a
+another method, are left out rather than failing the app. One whose every
+security alternative names an undeclared scheme is left out with
+`auth_method`. Reading or calling a
 left-out operation's tool fails with why, such as the JSON Pointer of an
 invalid schema. When none can be imported, the router's error lists the
 operations left out and why, and the origins the operations use when none
-matches `allowedOrigin`. Public APIs need no
+matches `allowedOrigin`. Both end by offering a
+[custom tool](#custom-tools-beside-generated-ones). Public APIs need no
 account: call `liveOpenapiRouter` without `accountRouter` and with
 `methods: {}` and `oauth: []`. `openapiRouter` is the lower-level helper for
 normalized metadata. Use `contentType` to choose an alternate declared request
@@ -377,19 +382,46 @@ console.log([...names].join("\n"));'
 
 ### Custom tools beside generated ones
 
-Mount the generated router under a key next to hand-written queries and
-mutations ([tools.md](tools.md)):
+Generated tools are a starting point, not a limit. When an operation is left
+out, a generated tool is modelled or gated wrongly, or the definition itself is
+wrong (such as `security: []` on calls that need a key), write a query or
+mutation for it in the same app ([tools.md](tools.md)). Return it from its own
+`accountRouter` callback, so it calls the API with the account the generated
+tools use:
 
 ```ts
 tools: router({
-  weeklySummary,
   api: await accountRouter(
     accounts.service,
     (account) => liveOpenapiRouter({ ...options, cache, fetch, signal, account }),
     { signal },
   ),
+  custom: await accountRouter(
+    accounts.service,
+    (account) =>
+      router({
+        uploadFile: mutation(
+          { description: "Upload a file", input: object({ name: string(), base64: string() }) },
+          async ({ fetch }, input) =>
+            decodeJson(
+              await fetch("https://api.example.com/v1/files", {
+                method: "POST",
+                headers: { Authorization: `Bearer ${account.fields.token}` },
+                body: JSON.stringify(input),
+              }),
+              object({ id: string() }),
+            ),
+        ),
+      }),
+    { signal },
+  ),
 }),
 ```
+
+Give it its own `approval`. To hide the generated tool it replaces, remove that
+operation with `patches`. The same works beside `mcpRouter` and
+`graphqlRouter`, but an MCP OAuth token often works only for its MCP server:
+call the service's REST API through a provider of its own.
 
 The key renames every generated tool: `projects.listProjects` becomes
 `api.projects.listProjects`. Update skills and callers that use the old names.

@@ -32,7 +32,7 @@ const refusal = (message: string) => ({
   error: {
     // JSON-RPC Invalid Request, as for the MCP transport's own rejections.
     code: -32600,
-    message: `GrantForbidden (HTTP 403): ${message}`,
+    message: `GrantForbidden (HTTP 403): ${message} Retryable (unchanged call): no.`,
     data: { code: "GrantForbidden", status: 403 },
   },
 });
@@ -390,7 +390,7 @@ layer(TestLive, { excludeTestServices: true })("Local scoped MCP connections", (
                 { app: app.id, runsAs: [{ kind: "app" }], tools: { kind: "readOnly" } },
               ]),
             ).toBe(
-              `GrantForbidden (HTTP 403): This credential’s grant does not include the tool “review” of the app ${app.id}. Recovery: Use a tool the grant includes, or add this tool to its connection or grant, then retry.`,
+              `GrantForbidden (HTTP 403): This credential’s grant does not include the tool “review” of the app ${app.id}. Recovery: Use a tool the grant includes, or add this tool to its connection or grant, then retry. Retryable (unchanged call): no.`,
             );
           }),
         );
@@ -406,7 +406,7 @@ layer(TestLive, { excludeTestServices: true })("Local scoped MCP connections", (
                 },
               ]),
             ).toBe(
-              `GrantForbidden (HTTP 403): This credential’s grant includes the app ${app.id}, but not running it without a profile. Recovery: Run the app as the grant allows, or add this target to its connection, then retry.`,
+              `GrantForbidden (HTTP 403): This credential’s grant includes the app ${app.id}, but not running it without a profile. Recovery: Run the app as the grant allows, or add this target to its connection, then retry. Retryable (unchanged call): no.`,
             );
           }),
         );
@@ -414,7 +414,7 @@ layer(TestLive, { excludeTestServices: true })("Local scoped MCP connections", (
           "A connection without the app names the app it excludes",
           Effect.gen(function* () {
             expect(yield* refusedAfter(pending[2].requestId, [])).toBe(
-              `GrantForbidden (HTTP 403): This credential’s grant does not include the app ${app.id}. Recovery: Use an app the grant includes, or add this app to its connection or grant, then retry.`,
+              `GrantForbidden (HTTP 403): This credential’s grant does not include the app ${app.id}. Recovery: Use an app the grant includes, or add this app to its connection or grant, then retry. Retryable (unchanged call): no.`,
             );
           }),
         );

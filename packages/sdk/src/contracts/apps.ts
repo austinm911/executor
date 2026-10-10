@@ -416,7 +416,7 @@ export const AppsGroup = HttpApiGroup.make("apps")
       error: [StorageError, ...sourceErrors, AppNotFound],
     }).annotate(
       OpenApi.Description,
-      "Save a complete file list as a commit on the working branch without deploying it. Omitted files are deleted. Returns the new revision; the files are not echoed.",
+      "Save a complete file list as a commit on the working branch without deploying it. Omitted files are deleted. Returns the new revision and `removed`: how many files this save deleted and the first of their paths; the files are not echoed. A deleted file stays at the `expected` revision (`GET /v1/apps/:app/revisions/:commit`): to keep it, commit again against the new revision with it before deploying. A file path cannot also be a folder (`a` and `a/b`); such a save fails with SourcePathConflict and saves nothing. Paths must be valid Unicode; a lone surrogate fails with SourcePathNotUnicode.",
     ),
     HttpApiEndpoint.get("history", "/v1/apps/:app/history", {
       params: appParams,

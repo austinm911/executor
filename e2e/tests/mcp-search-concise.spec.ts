@@ -7,7 +7,7 @@ import { TestLive, withCase } from "../support/case.ts";
 import { Evidence } from "../support/evidence.ts";
 import { McpClient } from "../support/mcp-client.ts";
 import { Target } from "../support/platform.ts";
-import { createProfile, selectProfileAccounts } from "../support/profiles.ts";
+import { connectLocalAccount, createProfile } from "../support/profiles.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
 
@@ -55,7 +55,6 @@ const Deployed = Schema.Struct({
     }),
   }),
 });
-const Account = Schema.Struct({ id: Schema.String });
 const Item = Schema.Struct({
   path: Schema.String,
   description: Schema.String,
@@ -140,32 +139,29 @@ layer(TestLive, { excludeTestServices: true })("MCP search concise", (it) => {
           ["Work key", "Reads only."],
           ["Sandbox key", null],
         ] as const) {
-          const account = yield* body(
-            Account,
-            yield* agent.send("POST", "/v1/accounts", {
-              owner: "local",
-              provider: app.requirements.accounts.service.provider,
-              method: "key",
-              label,
-              ...(description === null ? {} : { description }),
-              fields: { token: `synthetic-${randomUUID()}` },
-            }),
-          );
-          accounts.push(account.id);
           const profile = yield* createProfile(
             agent,
             `/v1/apps/${app.id}`,
             { owner: "local", subject: "local" },
             headers,
           );
-          const selected = yield* selectProfileAccounts(
+          const account = yield* connectLocalAccount(
             agent,
-            `/v1/apps/${app.id}`,
-            profile.id,
-            { service: account.id },
+            {
+              app: app.id,
+              profile: profile.id,
+              requirement: "service",
+              method: "key",
+              label,
+              fields: { token: `synthetic-${randomUUID()}` },
+            },
             headers,
           );
-          expect(selected.status).toBe(200);
+          accounts.push(account.id);
+          if (description !== null)
+            expect(
+              (yield* agent.send("PATCH", `/v1/accounts/${account.id}`, { description })).status,
+            ).toBe(200);
           profiles.push(profile.id);
         }
 

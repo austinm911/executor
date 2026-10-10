@@ -7,6 +7,7 @@ import { Api, body, type Session } from "../support/api.ts";
 import { Target } from "../support/platform.ts";
 import { TestLive, withCase } from "../support/case.ts";
 import { Resource } from "../support/contracts.ts";
+import { connectAccountsThroughOtherApp } from "../support/profiles.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
 
@@ -48,12 +49,13 @@ const SearchedPaths = Schema.Struct({
   alsoAt: Schema.optional(Schema.Array(Schema.String)),
 });
 const callablePaths = (item: typeof SearchedPaths.Type) => [item.path, ...(item.alsoAt ?? [])];
+const fixtureProvider = `defineProvider({ name: "Profile fixture", auth: { key: secrets({ label: "Key", fields: object({ token: string() }) }) } })`;
 const files = [
   {
     path: "index.ts",
     content: `
 import { defineApp, defineProvider, secrets, object, string, query, mutation, workflow, interval, router } from "apps";
-const service = defineProvider({ name: "Profile fixture", auth: { key: secrets({ label: "Key", fields: object({ token: string() }) }) } });
+const service = ${fixtureProvider};
 const shape = ctx => ({ auth: "auth" in ctx, profile: "profile" in ctx });
 const register = "INSERT INTO registrations (subscription, context, source) VALUES (?, ?, ?) ON CONFLICT (subscription) DO NOTHING";
 const write = mutation({ input: object({ body: string() }) }, async (ctx, input) => { ctx.sql.exec("INSERT INTO rows (account, body) VALUES (?, ?)", ctx.accounts.sink.id, input.body); return ctx.accounts.sink.id; });
@@ -133,17 +135,17 @@ layer(TestLive, { excludeTestServices: true })("Profiles", (it) => {
               yield* api.request(agent, "DELETE", `/v1/accounts/${account}`);
           }).pipe(Effect.orDie),
         );
-        for (const label of ["mail-a", "mail-b", "sink-a", "sink-b"]) {
-          const account = yield* api.request(agent, "POST", "/v1/accounts", {
-            owner,
-            provider: app.requirements.accounts.mail.provider,
-            method: "key",
+        // Saved accounts that no profile of this app selects yet.
+        for (const account of yield* connectAccountsThroughOtherApp(agent, {
+          owner,
+          provider: fixtureProvider,
+          method: "key",
+          accounts: ["mail-a", "mail-b", "sink-a", "sink-b"].map((label) => ({
             label,
             fields: { token: label },
-          });
-          expect(account.status).toBe(200);
-          accounts.push((yield* body(Resource, account)).id);
-        }
+          })),
+        }))
+          accounts.push(account.id);
         const [mailA, mailB, sinkA, sinkB] = accounts;
         if (!mailA || !mailB || !sinkA || !sinkB)
           return yield* Effect.die(new Error("Missing fixture account"));

@@ -5,7 +5,12 @@ import { initializeAppRepository, writeInitialSource } from "./initial-source.ts
 import { appSlug } from "../contracts/app-slug.ts";
 import { AppNameTaken, type AppCopyOrigin } from "../contracts/apps.ts";
 import { AppCodeId, AppId, StorageError } from "../contracts/shared.ts";
-import { SourceError, type AppSourceStorage, type RepositoryBackend } from "../contracts/source.ts";
+import {
+  SourceError,
+  sourcePathsFit,
+  type AppSourceStorage,
+  type RepositoryBackend,
+} from "../contracts/source.ts";
 import type { Executor, ResourceLifecycle } from "../contracts/executor.ts";
 import { query, transaction, type Query } from "./database.ts";
 import { storedApp, createApp as storeApp } from "./apps.ts";
@@ -24,6 +29,7 @@ export const makeAppAuthoring = (
     copiedFrom: AppCopyOrigin | null = null,
   ) =>
     Effect.gen(function* () {
+      yield* sourcePathsFit(input.files);
       const code = AppCodeId.make(
         `code_${yield* crypto.randomUUIDv4.pipe(Effect.mapError(() => new StorageError()))}`,
       );
@@ -87,13 +93,14 @@ export const makeAppAuthoring = (
       Effect.gen(function* () {
         const app = yield* storedApp(db, input);
         yield* initializeAppRepository(db, sources, blobs, app);
-        const { revision } = yield* sources.commit({
+        yield* sourcePathsFit(input.files);
+        const { revision, removed } = yield* sources.commit({
           code: app.code,
           expected: input.expected,
           files: input.files,
           message: input.message,
         });
-        return { revision };
+        return { revision, removed };
       }),
   };
 };

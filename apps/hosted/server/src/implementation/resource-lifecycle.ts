@@ -147,34 +147,29 @@ export const hostedResourceLifecycle = Effect.gen(function* () {
         const user = yield* CurrentUserId;
         if (user === undefined) return yield* new StorageError();
         // The SDK supplies the connection's reconnect target and the profile it targets, so the
-        // product checks its own access rows only. A targeted profile must be the caller's own,
+        // product checks its own access rows only. The targeted profile must be the caller's own,
         // enabled, and not on its way out.
         const target = connection.target;
         if (
-          target !== null &&
-          (target.profile.subject !== user ||
-            !target.profile.enabled ||
-            target.profile.status === "removing" ||
-            target.profile.status === "removed")
+          target.profile.subject !== user ||
+          !target.profile.enabled ||
+          target.profile.status === "removing" ||
+          target.profile.status === "removed"
         )
           return yield* new StorageError();
-        const targetApp = target === null ? null : target.app;
-        const targetProfile = target === null ? null : target.profile.id;
         const reconnect = connection.reconnectAccount;
         const rows =
           yield* sql`select c.connection_id, c.organization_id as organization, c.destination from hosted_connection_access c
         join member m on m."organizationId" = c.organization_id and m."userId" = ${user}
         where c.connection_id = ${connection.id}
         and c.creator_id = ${user}
-        and (c.target is null or (
-          (c.target ->> 'app') = ${targetApp} and (c.target ->> 'installation') = ${targetProfile}
-          and exists (
-            select 1 from hosted_app_access a
-            where a.id = (c.target ->> 'app') and a.organization_id = c.organization_id
-            and ((a.audience = 'private' and a.creator_id = ${user}) or a.audience = 'everyone'
-              or (a.audience = 'groups' and exists(select 1 from hosted_app_groups g join hosted_group_members gm on gm.group_id = g.group_id where g.app_id = a.id and gm.member_id = m.id)))
-          )
-        ))
+        and (c.target ->> 'app') = ${target.app} and (c.target ->> 'installation') = ${target.profile.id}
+        and exists (
+          select 1 from hosted_app_access a
+          where a.id = (c.target ->> 'app') and a.organization_id = c.organization_id
+          and ((a.audience = 'private' and a.creator_id = ${user}) or a.audience = 'everyone'
+            or (a.audience = 'groups' and exists(select 1 from hosted_app_groups g join hosted_group_members gm on gm.group_id = g.group_id where g.app_id = a.id and gm.member_id = m.id)))
+        )
         and (${reconnect}::text is null or exists (
           select 1 from hosted_account_access a where a.account_id = ${reconnect}
           and a.organization_id = c.organization_id

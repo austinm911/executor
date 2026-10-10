@@ -6,7 +6,7 @@ import { Api, body, type Session } from "../support/api.ts";
 import { TestLive, withCase } from "../support/case.ts";
 import { McpClient } from "../support/mcp-client.ts";
 import { Target } from "../support/platform.ts";
-import { createProfile, selectProfileAccounts } from "../support/profiles.ts";
+import { connectLocalAccount, createProfile } from "../support/profiles.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
 
@@ -89,32 +89,43 @@ export default defineApp({ accounts: { service } }, async () => ({ tools: router
           }).pipe(Effect.orDie),
         );
 
-        // A description is set when the account is created and returned with its metadata.
+        // Accounts connect for the app's profile; the last one connected stays selected.
+        const profile = yield* createProfile(
+          agent,
+          `/v1/apps/${app.id}`,
+          { owner: "local", subject: "local" },
+          headers,
+        );
+        const connect = (label: string, token: string) =>
+          connectLocalAccount(
+            agent,
+            {
+              app: app.id,
+              profile: profile.id,
+              requirement: "service",
+              method: "key",
+              label,
+              fields: { token },
+            },
+            headers,
+          ).pipe(Effect.tap((account) => Effect.sync(() => accounts.push(account.id))));
+        const undescribed = yield* connect("Sandbox key", "synthetic-sandbox-token");
+        expect(undescribed.description).toBeNull();
+        const connected = yield* connect("Work key", "synthetic-description-token");
+        expect(connected.description).toBeNull();
+
+        // A description is returned with the account's metadata once set.
         const created = yield* body(
           Account,
-          yield* agent.send("POST", "/v1/accounts", {
-            owner: "local",
-            provider: app.requirements.accounts.service.provider,
-            method: "key",
-            label: "Work key",
+          yield* agent.send("PATCH", `/v1/accounts/${connected.id}`, {
             description: "Reads only;\n  use the sandbox account for writes.",
-            fields: { token: "synthetic-description-token" },
           }),
         );
-        accounts.push(created.id);
-        expect(created.description).toBe("Reads only;\n  use the sandbox account for writes.");
-        const undescribed = yield* body(
-          Account,
-          yield* agent.send("POST", "/v1/accounts", {
-            owner: "local",
-            provider: app.requirements.accounts.service.provider,
-            method: "key",
-            label: "Sandbox key",
-            fields: { token: "synthetic-sandbox-token" },
-          }),
-        );
-        accounts.push(undescribed.id);
-        expect(undescribed.description).toBeNull();
+        expect(created).toEqual({
+          id: connected.id,
+          label: "Work key",
+          description: "Reads only;\n  use the sandbox account for writes.",
+        });
         const listed = yield* body(
           Schema.Array(Account),
           yield* agent.send(
@@ -128,21 +139,6 @@ export default defineApp({ accounts: { service } }, async () => ({ tools: router
             { id: undescribed.id, description: null },
           ]),
         );
-
-        const profile = yield* createProfile(
-          agent,
-          `/v1/apps/${app.id}`,
-          { owner: "local", subject: "local" },
-          headers,
-        );
-        const selected = yield* selectProfileAccounts(
-          agent,
-          `/v1/apps/${app.id}`,
-          profile.id,
-          { service: created.id },
-          headers,
-        );
-        expect(selected.status).toBe(200);
 
         // Agents read the selected account's label and description once, with the profile's
         // namespace, rather than with each of its tools.

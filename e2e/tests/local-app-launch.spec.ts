@@ -1,12 +1,13 @@
 import { expect, layer } from "@effect/vitest";
 import { Effect, Redacted, Schema } from "effect";
 import { randomUUID } from "node:crypto";
-import { Api, body } from "../support/api.ts";
+import { Api, body, type Session } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { committedDocuments, recordAppOpening, screens } from "../support/app-open-timeline.ts";
 import { TestLive, withCase } from "../support/case.ts";
 import { Resource } from "../support/contracts.ts";
 import { Target } from "../support/platform.ts";
+import { connectLocalAccount } from "../support/profiles.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
 const appSchema = Schema.Struct({
@@ -47,6 +48,14 @@ layer(TestLive, { excludeTestServices: true })("Local app launch", (it) => {
           target = yield* Target,
           session = yield* api.session();
         const headers = { authorization: `Bearer ${Redacted.value(target.apiKey)}` };
+        // Agent calls carry the API key and no browser origin.
+        const agent: Session = {
+          ...session,
+          send: (method, path, data, extra = {}) => {
+            const { origin: _origin, ...rest } = extra;
+            return session.send(method, path, data, { ...rest, ...headers });
+          },
+        };
         const send = (method: "POST" | "GET" | "DELETE", path: string, data?: unknown) =>
           session.send(method, path, data, headers);
         const appName = `Launch ${randomUUID().slice(0, 8)}`;
@@ -64,27 +73,30 @@ layer(TestLive, { excludeTestServices: true })("Local app launch", (it) => {
         );
         const create = (label: string, token = "synthetic-launch-token") =>
           Effect.gen(function* () {
-            const account = yield* body(
-              Resource,
-              yield* send("POST", "/v1/accounts", {
-                owner: "local",
-                provider: app.requirements.accounts.service.provider,
-                method: "key",
-                label,
-                fields: { token },
-              }),
-            );
-            owned.push(`/v1/accounts/${account.id}`);
             const profile = yield* body(
               Resource,
               yield* send("POST", `/v1/apps/${app.id}/profiles`, {
                 owner: "local",
                 subject: "local",
                 name: label,
-                accounts: { service: account.id },
+                accounts: {},
                 idempotencyKey: randomUUID(),
               }),
             );
+            // Connecting the account for the profile selects it there.
+            const account = yield* connectLocalAccount(
+              agent,
+              {
+                app: app.id,
+                profile: profile.id,
+                requirement: "service",
+                method: "key",
+                label,
+                fields: { token },
+              },
+              headers,
+            );
+            owned.push(`/v1/accounts/${account.id}`);
             return { account: account.id, profile: profile.id };
           });
         const personal = yield* create("Personal");

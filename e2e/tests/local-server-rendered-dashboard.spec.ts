@@ -2,10 +2,10 @@
 import { expect, layer } from "@effect/vitest";
 import { Effect, Redacted, Schema } from "effect";
 import { randomUUID } from "node:crypto";
-import { Api, body } from "../support/api.ts";
+import { Api, body, type Session } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { TestLive, withCase } from "../support/case.ts";
-import { Resource } from "../support/contracts.ts";
+import { connectLocalAccount, createProfile } from "../support/profiles.ts";
 import { Target } from "../support/platform.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
@@ -31,6 +31,14 @@ layer(TestLive, { excludeTestServices: true })("Local server-rendered dashboard"
           target = yield* Target,
           session = yield* api.session();
         const headers = { authorization: `Bearer ${Redacted.value(target.apiKey)}` };
+        // Agent calls carry the API key and no browser origin.
+        const agent: Session = {
+          ...session,
+          send: (method, path, data, extra = {}) => {
+            const { origin: _origin, ...rest } = extra;
+            return session.send(method, path, data, { ...rest, ...headers });
+          },
+        };
         const send = (method: "GET" | "POST" | "DELETE", path: string, data?: unknown) =>
           session.send(method, path, data, headers);
         const { app } = yield* body(
@@ -54,26 +62,25 @@ export default defineApp({accounts:{service}},async()=>({tools:router({identity}
         yield* Effect.addFinalizer(() =>
           Effect.forEach(owned, (path) => send("DELETE", path)).pipe(Effect.orDie),
         );
-        const account = yield* body(
-          Resource,
-          yield* send("POST", "/v1/accounts", {
-            owner: "local",
-            provider: app.requirements.accounts.service.provider,
+        const profile = yield* createProfile(
+          agent,
+          `/v1/apps/${app.id}`,
+          { owner: "local", subject: "local", name: "Rendered" },
+          headers,
+        );
+        const account = yield* connectLocalAccount(
+          agent,
+          {
+            app: app.id,
+            profile: profile.id,
+            requirement: "service",
             method: "key",
             label: "Rendered account",
             fields: { token: "synthetic-rendered-key" },
-          }),
+          },
+          headers,
         );
         owned.push(`/v1/accounts/${account.id}`);
-        expect(
-          (yield* send("POST", `/v1/apps/${app.id}/profiles`, {
-            owner: "local",
-            subject: "local",
-            name: "Rendered",
-            accounts: { service: account.id },
-            idempotencyKey: randomUUID(),
-          })).status,
-        ).toBe(200);
         const { url } = yield* body(
           Schema.Struct({ url: Schema.String }),
           yield* send("POST", "/auth/pair"),

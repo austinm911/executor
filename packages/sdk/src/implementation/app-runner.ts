@@ -2,7 +2,9 @@
  * The one app Worker runner. It runs beside the Worker Loader on every host: in the Cloud API
  * Worker, and in the trusted apps Worker of self-host and local. It names each Worker, loads it,
  * wraps the authored modules and delivers each call's accounts, run, approval, replay and deadline.
- * Secret fields of providers that declare hosts leave the runner only as sealed handles.
+ * Secret fields of providers that declare hosts, and every string of a managed account, leave the
+ * runner only as sealed handles: `bundleAccounts` is the one path from the host's accounts to the
+ * accounts a bundle reads.
  * A host supplies only its bindings and, per invocation, a build loader that the runner calls from
  * the Worker Loader's cold-start callback, so a warm call reads and transfers no code. Every
  * request and reply passes through the adapter of the protocol the build's framework speaks.
@@ -12,10 +14,12 @@ import { Clock, Effect, Exit, Option, Redacted, Result, Schema, Semaphore } from
 import {
   ElicitationReply,
   type HostRequest,
+  type HostAccounts,
   type InvocationDeadline,
   type ResolvedAccounts,
   type TrustedToolApproval,
   type WorkflowExecution,
+  WorkflowFailure,
   type WorkflowReplay,
 } from "apps/contracts";
 import { AppDatabaseError } from "@executor-js/app-data/contracts";
@@ -46,10 +50,10 @@ import type { LoadedWorkerBuild, WorkerBundle } from "../contracts/worker-build.
 import { appProtocol, type AppProtocol } from "./app-protocols.ts";
 import { appFacetBridge, appNetworkModuleName, appRpcBridge } from "./worker-bridge.ts";
 import { appNetworkModule } from "./app-network.ts";
-import { sealAccounts } from "./credential-handles.ts";
+import { sealAccounts, unsealedAccounts } from "./credential-handles.ts";
 import { AppRpcEntrypoint, AppRpcInvocation } from "./worker-elicitation.ts";
 import { invocationWorkflow } from "./worker-workflow-rpc.ts";
-import type { AppWorkerResidency } from "./app-worker-residency.ts";
+import { type AppWorkerResidency, namedWorker } from "./app-worker-residency.ts";
 
 type Callback = (input: unknown) => Promise<unknown>;
 
@@ -83,6 +87,11 @@ export interface AppRunnerHost {
    * Shared by every runner in the process.
    */
   readonly residency?: AppWorkerResidency;
+  /**
+   * Unload an app's facet Worker for one execution context when it is idle, so facet Workers count
+   * against the residency's limit. True once it is unloaded. Supplied with a residency.
+   */
+  readonly unloadFacet?: (app: string, identity: string) => Effect.Effect<boolean, unknown>;
 }
 
 /** The authorized call. Credentials travel here, never in a Worker name or retained code. */
@@ -91,7 +100,7 @@ export interface AppInvocation {
   readonly build: string;
   readonly database: boolean;
   readonly command: HostRequest;
-  readonly accounts: typeof ResolvedAccounts.Type;
+  readonly accounts: HostAccounts;
   readonly approval?: typeof TrustedToolApproval.Type;
   readonly replay?: typeof WorkflowReplay.Type;
   readonly deadline?: typeof InvocationDeadline.Type;
@@ -341,25 +350,40 @@ export const appWorker = (
   );
 
 /**
- * A workflow whose steps read their accounts as this app's invocations do: secret fields of
- * providers with hosts are sealed. The host resolves current credentials for each step.
+ * The accounts a bundle of this protocol reads. A bundle that reads sealed handles gets the
+ * secret fields of providers with hosts, and every string of a managed account, sealed. An
+ * earlier bundle reads every field as a real value, so it gets accounts as they are, and an
+ * invocation of it with a managed account fails without reaching it.
  */
-const sealedWorkflow = (
-  execution: WorkflowExecution,
+const bundleAccounts = (
+  protocol: AppProtocol,
   app: string,
   key: Effect.Effect<CryptoKey>,
+  accounts: HostAccounts,
+): Effect.Effect<ResolvedAccounts, RuntimeProtocolFailed> => {
+  if (protocol.sealedCredentials) return sealAccounts(accounts, { app, key });
+  const unsealed = unsealedAccounts(accounts);
+  return unsealed === undefined ? failed("managed") : Effect.succeed(unsealed);
+};
+
+/**
+ * A workflow whose steps read their accounts as this app's invocations do, through
+ * `bundleAccounts`. The host resolves current credentials for each step.
+ */
+const boundWorkflow = (
+  execution: WorkflowExecution,
+  accounts: (resolved: HostAccounts) => Effect.Effect<ResolvedAccounts, RuntimeProtocolFailed>,
 ): WorkflowExecution => ({
   ...execution,
   resolve: () =>
-    execution
-      .resolve()
-      .pipe(
-        Effect.flatMap((context) =>
-          sealAccounts(Redacted.value(context.accounts), { app, key }).pipe(
-            Effect.map((accounts) => ({ ...context, accounts: Redacted.make(accounts) })),
-          ),
+    execution.resolve().pipe(
+      Effect.flatMap((context) =>
+        accounts(Redacted.value(context.accounts)).pipe(
+          Effect.mapError(() => new WorkflowFailure({ reason: "credentials", retryable: false })),
+          Effect.map((accounts) => ({ ...context, accounts: Redacted.make(accounts) })),
         ),
       ),
+    ),
 });
 
 /** Times one step of an invocation on the runner's clock. */
@@ -431,8 +455,9 @@ export const makeAppRunner = (host: AppRunnerHost) => {
         const unhold =
           name === null || residency === undefined
             ? Effect.void
-            : yield* Effect.acquireRelease(residency.hold(host.loader, name), (unhold) =>
-                held ? Effect.void : unhold,
+            : yield* Effect.acquireRelease(
+                residency.hold(name, namedWorker(host.loader, name), host.waitUntil),
+                (unhold) => (held ? Effect.void : unhold),
               );
         const services = yield* Effect.context<never>();
         const load = async () => {
@@ -678,13 +703,9 @@ export const makeAppRunner = (host: AppRunnerHost) => {
         // A command this protocol's bundles would not run as asked fails without reaching them.
         const refused = protocol.refuse(invocation.command);
         if (refused !== undefined) return { ok: false, error: refused };
-        // A bundle from before credential hosts reads every field as a real value.
-        const accounts = protocol.sealedCredentials
-          ? yield* sealAccounts(invocation.accounts, {
-              app: invocation.app,
-              key: host.credentialKey,
-            })
-          : invocation.accounts;
+        const accountsFor = (resolved: HostAccounts) =>
+          bundleAccounts(protocol, invocation.app, host.credentialKey, resolved);
+        const accounts = yield* accountsFor(invocation.accounts);
         const body = protocol.invocation({
           command: invocation.command,
           accounts,
@@ -696,14 +717,34 @@ export const makeAppRunner = (host: AppRunnerHost) => {
             : { workflowRun: capabilities.workflow.runId }),
         });
         if (mode === "facet")
-          return yield* facet(
-            invocation,
-            identity,
-            capabilities,
-            protocol,
-            load,
-            body,
-            timing.waiting,
+          return yield* Effect.scoped(
+            Effect.gen(function* () {
+              // The facet Worker counts against the same limit as app Workers while it is loaded.
+              const unloadFacet = host.unloadFacet;
+              if (host.residency !== undefined && unloadFacet !== undefined) {
+                const hold = host.residency.hold(
+                  `data:${name}`,
+                  {
+                    run: unloadFacet(invocation.app, identity).pipe(
+                      Effect.orElseSucceed(() => false),
+                    ),
+                    // The supervisor replaces a facet Worker whose unload does not settle.
+                    abandon: () => undefined,
+                  },
+                  host.waitUntil,
+                );
+                yield* Effect.acquireRelease(hold, (unhold) => unhold).pipe(Effect.asVoid);
+              }
+              return yield* facet(
+                invocation,
+                identity,
+                capabilities,
+                protocol,
+                load,
+                body,
+                timing.waiting,
+              );
+            }),
           );
         const data = host.data(invocation.app);
         const services = yield* Effect.context<never>();
@@ -755,11 +796,7 @@ export const makeAppRunner = (host: AppRunnerHost) => {
           ...(capabilities.workflow === undefined
             ? {}
             : {
-                workflow: protocol.workflow(
-                  protocol.sealedCredentials
-                    ? sealedWorkflow(capabilities.workflow, invocation.app, host.credentialKey)
-                    : capabilities.workflow,
-                ),
+                workflow: protocol.workflow(boundWorkflow(capabilities.workflow, accountsFor)),
               }),
           cache,
           explain: false,

@@ -191,7 +191,7 @@ export const executionManagerOwner = (executor: Executor, app: AppId, profile?: 
     else yield* ownProfile(executor, owner, app, profile);
     return owner;
   });
-/** A connection must still belong to this organization, along with its optional target app. */
+/** A connection must still belong to this organization, along with its target app. */
 export const ownedConnection = (
   executor: Executor,
   owner: OwnerId,
@@ -199,7 +199,7 @@ export const ownedConnection = (
 ) =>
   Effect.gen(function* () {
     const current = yield* executor.accountConnections.get({ owner, connection });
-    if (current.target !== null) yield* executor.apps.get({ owner, app: current.target.app });
+    yield* executor.apps.get({ owner, app: current.target.app });
     return current;
   });
 

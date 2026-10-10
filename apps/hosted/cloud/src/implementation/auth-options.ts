@@ -1,7 +1,8 @@
 /** Cloud sign-in policy; self-hosted deployments do not need these OAuth credentials. */
+import { siteVisitorCookie } from "@executor-js/marketing/site-visitor";
 import type { BetterAuthOptions } from "better-auth";
 import { APIError } from "better-auth/api";
-import { authOptions } from "@executor-js/hosted-server";
+import { authOptions, type RefreshRejection } from "@executor-js/hosted-server";
 import { HttpUrl } from "@executor-js/sdk/core";
 import { cloudHosts, type CloudHosts } from "../infrastructure/stage.ts";
 import { passkey } from "@better-auth/passkey";
@@ -186,9 +187,9 @@ export const cloudAuthOptions = (
   onLogin?: (userId: string) => Promise<void>,
   onOperation?: (usage: NativeAuthUsage) => Promise<void>,
   allowsOrganization?: (userId: string) => Promise<boolean>,
-  onRefreshFamilyRevoked?: () => void,
+  onRefreshRejected?: (rejection: RefreshRejection) => void,
 ) => {
-  const base = authOptions(settings, ipAddressHeaders, onRefreshFamilyRevoked);
+  const base = authOptions(settings, ipAddressHeaders, onRefreshRejected);
   // A test stage that signs in through production's proxy uses production's callback, which the
   // proxy sets. Every other deployment names its own social callback origin explicitly.
   const proxiedElsewhere = Option.exists(
@@ -289,8 +290,21 @@ export const cloudAuthOptions = (
       },
       session: {
         create: {
-          after: async (session) => {
+          // Consume the site visitor identity on every successful sign-in, including returning
+          // users. It must never be linked to a second account later.
+          after: async (session, context) => {
             if (onLogin !== undefined) await onLogin(session.userId);
+            if (!context) return;
+            context.setCookie(siteVisitorCookie, "", {
+              path: "/",
+              maxAge: 0,
+              sameSite: "lax",
+              secure: new URL(settings.url).protocol === "https:",
+              ...Option.match(settings.hosts.sharedCookieDomain, {
+                onNone: () => ({}),
+                onSome: (domain) => ({ domain }),
+              }),
+            });
           },
           before: async (session, context) => {
             if (!context) throw new APIError("UNAUTHORIZED");
@@ -417,6 +431,9 @@ export const cloudAuthOptions = (
         storeOTP: "hashed",
         expiresIn: emailCodeExpiresIn,
         allowedAttempts: 3,
+        // A signed-in session alone cannot move the account: the current address approves the
+        // change with its own code, then the new address proves ownership with another.
+        changeEmail: { enabled: true, verifyCurrentEmail: true },
         // Better Auth sends sign-in codes to new emails too; their first code creates the account.
         sendVerificationOTP: async (data, ctx) => {
           const signUp =

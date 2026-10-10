@@ -45,6 +45,7 @@ export { migrateOrganizationRemovals } from "./implementation/organization-remov
 
 export { hostedOAuthCallback } from "./implementation/accounts.ts";
 export * from "./contracts/oauth-client-metadata.ts";
+export { firstPartyOAuthClients } from "./implementation/first-party-oauth.ts";
 export {
   clientMetadataDocument,
   clientMetadataSetting,
@@ -65,6 +66,7 @@ export {
   provisionHostedConnectionResources,
   provisionHostedOAuthResources,
   type HostedOAuthOrigins,
+  type RefreshRejection,
 } from "./implementation/mcp-oauth.ts";
 export { authEndpointTemplates, grantExpiry, type GrantExpiry } from "@executor-js/mcp-auth/oauth";
 export type { OriginList, ResourceOrigins } from "@executor-js/mcp-auth";

@@ -38,9 +38,16 @@ export const CatalogFeed = Schema.Struct({
   version: Schema.Literal(1),
   data: Schema.Array(CatalogEntry),
 });
+/** What to do next: a short step, and instructions for the agent that sets the service up. */
+export const CatalogRecovery = Schema.Struct({
+  action: Schema.NonEmptyString,
+  instructions: Schema.NonEmptyString,
+});
+export type CatalogRecovery = typeof CatalogRecovery.Type;
 /**
  * Import failures expose a safe, actionable reason, never a fetched document or credential. A
- * failed MCP server check also carries its typed detection and the signals that decided it.
+ * failed MCP server check also carries its typed detection and the signals that decided it. A
+ * catalog entry its caller's agent must set up carries the setup prompt as `recovery`.
  */
 export class CatalogImportFailed extends Schema.TaggedError<CatalogImportFailed>()(
   "CatalogImportFailed",
@@ -59,6 +66,7 @@ export class CatalogImportFailed extends Schema.TaggedError<CatalogImportFailed>
     ]),
     reason: Schema.String,
     detection: Schema.optionalKey(McpDetection),
+    recovery: Schema.optionalKey(CatalogRecovery),
     // Optional on the wire for older clients; restored from safe fields on decode.
     message: Schema.optionalKey(Schema.String).pipe(
       Schema.decodeTo(Schema.optionalKey(Schema.String), {

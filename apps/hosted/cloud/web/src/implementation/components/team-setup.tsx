@@ -20,6 +20,7 @@ import {
   type SelectedOrganizationIcon,
 } from "@executor-js/hosted-web/contracts/organization-icon";
 import { Button } from "@executor-js/ui/components/button";
+// oxlint-disable-next-line no-restricted-imports -- OrganizationEntryGate renders it only at /, which its navigation leaves; TeamEntry reads atoms, not the location
 import { Link, Navigate, useLocation } from "@tanstack/react-router";
 import { Cause, Exit, Option, Schema } from "effect";
 import { AsyncResult, Atom } from "effect/reactivity";
@@ -37,17 +38,14 @@ import { prepareTeamAtom, createTeamAtom } from "../../contracts/onboarding.ts";
 export function TeamSetupBoundary({ children }: { readonly children: ReactNode }) {
   const session = Option.getOrUndefined(AsyncResult.value(useAtomValue(sessionAtom)));
   const { pathname } = useLocation();
-  if (
-    session === undefined ||
-    session === null ||
-    (pathname !== "/" && pathname !== "/mcp/authorize")
-  )
-    return children;
+  // Approving a client, by consent or by a device's code, can create the first team on the way.
+  const approval = pathname === "/mcp/authorize" || pathname === "/device";
+  if (session === undefined || session === null || (pathname !== "/" && !approval)) return children;
   return (
     <OrganizationEntryGate
       key={session.user.id}
       userId={session.user.id}
-      destination={pathname === "/mcp/authorize" ? "mcp" : "entry"}
+      destination={approval ? "mcp" : "entry"}
     >
       {children}
     </OrganizationEntryGate>

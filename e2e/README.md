@@ -102,8 +102,9 @@ statement's rows, and leaves the product stopped. `serverControl("start")` then
 boots the current server over that state, as an upgrade would. Statement errors
 roll back the whole write.
 
-Use it only for legacy or upgrade-era data, and for reading rows that exist only
-in storage. Create everything else through the product, as usual. The boundary
+Use it only for legacy or upgrade-era data, for reading rows that exist only
+in storage, and for a storage fault no public surface can cause, such as a
+trigger that fails one owner's writes to one table. Create everything else through the product, as usual. The boundary
 check rejects any use outside a declared scenario. Only scenarios and the runner
 may import the module, and it is the only file allowed a database driver. The
 control route refuses undeclared scenarios at runtime. Self-host and Local
@@ -822,9 +823,22 @@ the CLI with a stand-in keyring module that reproduces the package's errors: an
 absent store, a cancelled or dismissed prompt, and a store that grants access.
 Only an absent store may fall back to `keys.json`. The key storage scenario
 covers `EXECUTOR_KEY_STORAGE`: `file` on a new or denied-pending directory,
-no-ops on matching directories, refusals on mismatched ones, and invalid values. On Linux outside a D-Bus
+no-ops on matching directories, refusals on mismatched ones, and invalid values. The pair scenario
+pairs with a running server whose key is in the stand-in store, and refuses denied, absent, missing
+and unfinished keys without writing anything. On Linux outside a D-Bus
 session, set `EXECUTOR_E2E_CREDENTIAL_STORE=absent` to use the real missing
 Secret Service for the key file scenario instead; release CI runs both.
+
+The npm launcher scenario unpacks the launcher and native archives as npm lays
+them out, then starts `--version` through every launcher entry point, including
+Executor 1's `bin/executor`, which stale command shims still start:
+
+```sh
+bun run release:wrapper
+EXECUTOR_E2E_LAUNCHER_ARCHIVE=.local/releases/<version>/wrapper/executor-<version>.tgz \
+EXECUTOR_E2E_RUNTIME_ARCHIVE=/path/to/executor-<version>-<platform>-<arch>.tgz \
+  bunx vitest run --config e2e/npm-launcher.config.ts
+```
 
 The desktop artifact smoke uses the packaged executable, synthetic secrets and a
 fresh profile/data directory. It deploys a dependency-using app, calls it, closes

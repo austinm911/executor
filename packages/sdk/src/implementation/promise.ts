@@ -79,13 +79,10 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
       answer: (input) => run(ScheduleInputs.answer, input, executor.schedules.answer),
     },
     accounts: {
-      add: (input) => run(AccountInputs.add, input, executor.accounts.add),
       get: (input) => run(AccountInputs.get, input, executor.accounts.get),
       provider: (input) => run(AccountInputs.get, input, executor.accounts.provider),
       list: (input = {}) => run(AccountInputs.list, input, executor.accounts.list),
       update: (input) => run(AccountInputs.update, input, executor.accounts.update),
-      replaceCredentials: (input) =>
-        run(AccountInputs.replaceCredentials, input, executor.accounts.replaceCredentials),
       remove: (input) => run(AccountInputs.remove, input, executor.accounts.remove),
       signIn: (input) => run(AccountInputs.get, input, executor.accounts.signIn),
       providers: (input = {}) => run(AccountInputs.providers, input, executor.accounts.providers),

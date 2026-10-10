@@ -1,14 +1,15 @@
 import { expect, layer } from "@effect/vitest";
-import { Effect, Schema } from "effect";
+import { Effect, Redacted, Schema } from "effect";
 import type { Page } from "playwright";
 import { randomUUID } from "node:crypto";
-import { Actors } from "../support/actors.ts";
+import { Actors, password } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { saveAndDeploy, Workspace } from "../support/app-authoring.ts";
 import { App, Resource } from "../support/contracts.ts";
 import { nameConnectedAccount } from "../support/name-account.ts";
+import { Target } from "../support/platform.ts";
 import { holdQuery, refreshVisiblePage } from "../support/query-transition.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
@@ -149,8 +150,84 @@ export default defineApp({ accounts: { primary: service, mailboxes: service.many
             expect(rows).toEqual(expected);
           });
         yield* browser.login(actors.owner);
-        const url = `/org/${actors.organization.slug}/apps/${app.id}?view=accounts&profile=${profile.id}`;
-        yield* browser.use("Open app accounts", (page) => page.goto(url));
+        const pageErrors: string[] = [];
+        yield* browser.use("Record uncaught page errors", (page) => {
+          page.on("pageerror", (error) => pageErrors.push(error.message));
+          return Promise.resolve();
+        });
+        const appPath = `/org/${actors.organization.slug}/apps/${app.id}`;
+        const url = `${appPath}?view=accounts&profile=${profile.id}`;
+        // Older setup links open the app's Accounts tab. The server answers them with that address
+        // before any page renders; a redirect rendered by the page restarted itself whenever the
+        // organization layout re-rendered, so it never finished and froze the tab. Once loaded,
+        // the page names the selected profile, so both links settle on the same address.
+        const address = (at: URL) => at.pathname + at.search;
+        const settles = (step: string) =>
+          Effect.gen(function* () {
+            expect(
+              yield* browser.use(step, (page) =>
+                page
+                  .waitForURL((current) => address(current) === url)
+                  .then(() =>
+                    page
+                      .getByRole("navigation", { name: "App navigation" })
+                      .locator('[aria-current="page"]')
+                      .textContent(),
+                  ),
+              ),
+              "the tab the old link opens",
+            ).toBe("Accounts");
+          });
+        const openSetupLink = (step: string, link: string, served: string) =>
+          Effect.gen(function* () {
+            expect(
+              yield* browser.use(step, (page) =>
+                page.goto(link).then((response) => response && address(new URL(response.url()))),
+              ),
+              "the document the old link opens",
+            ).toBe(served);
+            yield* settles(`${step} and settles there`);
+          });
+        const setupLink = `${appPath}/setup?profile=${profile.id}`;
+        yield* openSetupLink(
+          "An old setup link opens the Accounts tab",
+          `${appPath}/setup`,
+          `${appPath}?view=accounts`,
+        );
+        yield* openSetupLink("An old setup link keeps its profile", setupLink, url);
+        // Signed out, the link asks for sign-in first, which returns to it.
+        const signIn = yield* browser.use("Open an old setup link signed out", (page) =>
+          page
+            .context()
+            .clearCookies()
+            .then(() => page.goto(setupLink))
+            .then((response) => response && new URL(response.url())),
+        );
+        expect(signIn?.pathname, "a signed-out setup link").toBe("/login");
+        expect(signIn?.searchParams.get("redirect"), "sign-in returns to the old link").toBe(
+          setupLink,
+        );
+        if ((yield* Target).metadata.target === "self-host")
+          yield* browser.use("Sign in with the owner's password", (page) =>
+            page
+              .getByLabel("Email", { exact: true })
+              .fill("owner@example.test")
+              .then(() => page.getByLabel("Password", { exact: true }).fill(password))
+              .then(() => page.getByRole("button", { name: "Sign in", exact: true }).click()),
+          );
+        else {
+          // Cloud fixture users cannot receive sign-in codes; the session arrives as a cookie and
+          // the sign-in page is reloaded to continue its return navigation.
+          const cookies = yield* actors.owner.cookies;
+          yield* browser.use("Continue from sign-in with the owner's session", (page) =>
+            page
+              .context()
+              .addCookies([...Redacted.value(cookies)])
+              .then(() => page.reload()),
+          );
+        }
+        // The rest of this scenario uses the page the old link opened after sign-in.
+        yield* settles("Sign-in returns through the old setup link to the Accounts tab");
         // Connecting both accounts to the single-account slot left the second one bound.
         yield* shows("primary", "Every saved account is listed oldest first", [
           "First account",
@@ -165,6 +242,7 @@ export default defineApp({ accounts: { primary: service, mailboxes: service.many
             page.getByRole("dialog").count(),
           ),
         ).toBe(0);
+        expect(pageErrors).toEqual([]);
         yield* browser.checkpoint("Saved accounts listed in place");
         const failure = yield* holdQuery(
           [actors.organization.slug, actors.organization.id].map(
@@ -390,14 +468,32 @@ export default defineApp({ accounts: { primary: service, mailboxes: service.many
         ).toBe(0);
         expect(yield* bindings).toEqual({ mailboxes: [accounts[0], third] });
         expect(
-          yield* browser.use("Only selected mailboxes offer removal", () =>
+          yield* browser.use("Every mailbox has a menu", () =>
             Promise.all(
               ["First account", "Second account", "Third account"].map((label) =>
                 mailboxes.getByRole("button", { name: `Manage ${label}`, exact: true }).count(),
               ),
             ),
           ),
-        ).toEqual([1, 0, 1]);
+        ).toEqual([1, 1, 1]);
+        const removals: number[] = [];
+        for (const label of ["First account", "Second account", "Third account"])
+          removals.push(
+            yield* browser.use(`Open the ${label} menu`, (page) =>
+              mailboxes
+                .getByRole("button", { name: `Manage ${label}`, exact: true })
+                .click()
+                .then(() => page.getByRole("menu").waitFor({ state: "visible" }))
+                .then(() => page.getByRole("menuitem", { name: "Remove", exact: true }).count())
+                .then((count) =>
+                  page.keyboard
+                    .press("Escape")
+                    .then(() => page.getByRole("menu").waitFor({ state: "hidden" }))
+                    .then(() => count),
+                ),
+            ),
+          );
+        expect(removals, "Only selected mailboxes offer removal").toEqual([1, 0, 1]);
         yield* Effect.gen(function* () {
           yield* browser.use("Remove the mailbox from its row", () =>
             mailboxes.getByRole("checkbox", { name: "Third account", exact: true }).hover(),

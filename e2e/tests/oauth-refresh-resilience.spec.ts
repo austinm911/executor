@@ -11,7 +11,13 @@ import { Evidence, Telemetry } from "../support/evidence.ts";
 import { oauthSetupIssuer } from "../support/oauth-setup-issuer.ts";
 import { createProfile, selectProfileAccounts } from "../support/profiles.ts";
 import { scenarios } from "../test-plan.ts";
-import { appsManifest } from "../support/apps-release.ts";
+import { appsManifest, databaseFiles } from "../support/apps-release.ts";
+import { recordingService } from "../support/recording-service.ts";
+import {
+  expectUnknownOutcome,
+  unknownOutcomeAction,
+  unknownOutcomeRecovery,
+} from "../support/write-outcome.ts";
 
 const AppProvider = Schema.Struct({
   id: Schema.String,
@@ -45,6 +51,13 @@ const privateError = { error_description: "PRIVATE_PROVIDER_ERROR" };
  * connection, a 200 without an access token, a refused client, another refusal, or a revoked
  * grant (`invalid_grant`).
  */
+/**
+ * The recovery after a temporary renewal failure inside a call that may write. It promises no
+ * renewal on the next use, which a token without an expiry would not get.
+ */
+const renewalInsideWrite =
+  "Respect any wait specified by the renewal error; a later safe read that uses this account may trigger renewal when access is due for renewal or rejected again. If renewal keeps failing, inspect its error and reconnect only when the service indicates it is needed.";
+
 const refreshFailures = {
   unavailable: { status: 503, body: {} },
   rate_limited: { status: 429, body: {}, retryAfter: "30" },
@@ -652,6 +665,296 @@ layer(HostedLive, { excludeTestServices: true })("OAuth refresh resilience", (it
         const stillEnded = yield* read(session.profile);
         expect(stillEnded.status, JSON.stringify(stillEnded.body)).toBe(409);
         expect(yield* refreshes).toBe(renewed + 2);
+      }),
+    ),
+  );
+  it.effect(scenarios.oauthRenewalFailedAfterWrite.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { api, actors, issuer, prefix, name, connect, refreshes, assertPrivate } =
+          yield* renewalFixture;
+        const records = yield* recordingService;
+        // `save` hands a record to a service that saves it later, then presents the account's
+        // token. `check` only presents the token, and `records` reads the saved records.
+        const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+          name: `${name} records`,
+          files: [
+            {
+              path: "index.ts",
+              content: `import { defineApp, defineProvider, oauth2, query, mutation, object, string, router, ProviderError } from "apps";
+const service = defineProvider({ name: ${JSON.stringify(`${name} records`)}, auth: { oauth: oauth2({ discover: ${JSON.stringify(`${issuer.origin}/mcp`)} }) } });
+const records = ${JSON.stringify(records.url)};
+async function present(fetch, account, method) {
+  const response = await fetch(${JSON.stringify(`${issuer.origin}/resource`)}, { method, headers: { authorization: "Bearer " + account.fields.access_token } });
+  if (response.status === 401) throw new ProviderError({ reason: "unauthorized", status: 401, accountId: account.id });
+  return await response.json();
+}
+export default defineApp({ accounts: { service } }, async ({ accounts }) => ({
+  tools: router({
+    save: mutation({ input: object({ name: string() }) }, async ({ fetch }, { name }) => {
+      await fetch(records + "/records?pending", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
+      await present(fetch, accounts.service, "POST");
+      return { saved: name };
+    }),
+    check: query({ input: object({}) }, async ({ fetch }) => present(fetch, accounts.service, "GET")),
+    records: query({ input: object({}) }, async ({ fetch }) => (await fetch(records + "/records")).json()),
+  }),
+}));`,
+            },
+            appsManifest,
+          ],
+        });
+        expect(deployed.status, JSON.stringify(deployed.body)).toBe(200);
+        const app = yield* body(AppProvider, deployed);
+        yield* Effect.addFinalizer(() =>
+          api.request(actors.owner, "DELETE", `${prefix}/apps/${app.id}`).pipe(Effect.orDie),
+        );
+        const call = (profile: string, tool: string, kind: string, input: object) =>
+          api.request(actors.owner, "POST", `${prefix}/apps/${app.id}/tools/call`, {
+            profile,
+            tool,
+            kind,
+            input,
+          });
+        const saved = (profile: string) =>
+          call(profile, "records", "query", {}).pipe(
+            Effect.flatMap((response) =>
+              body(Schema.Struct({ records: Schema.Array(Schema.String) }), response),
+            ),
+            Effect.map(({ records }) => records),
+          );
+
+        // Salesforce-style: no `expires_in`, so only the service's refusal starts a renewal. The
+        // token endpoint is down when it does.
+        yield* issuer.configure({ expiresIn: null });
+        const session = yield* connect("Synthetic records account", app.id);
+        yield* issuer.expireAccessTokens;
+        yield* issuer.configure({ tokenError: refreshFailures.unavailable });
+
+        // The service accepted the record, then refused the token. Renewing it failed after the
+        // call was dispatched, so the failure is the call's: its outcome is unknown. A token with
+        // no expiry is renewed only when the service refuses it again, so the recovery promises no
+        // renewal on the next use and leaves out the renewal's own advice to try again.
+        const beforeWrite = yield* refreshes;
+        const posts = (yield* issuer.metrics).resourceRequests.POST;
+        const written = yield* call(session.profile, "save", "mutation", { name: "first" });
+        expect(written.status, JSON.stringify(written.body)).toBe(502);
+        expect(written.body).toMatchObject({
+          _tag: "AppProviderFailed",
+          reason: "unauthorized",
+          status: 401,
+          account: { id: session.account },
+          mayHaveWritten: true,
+          renewalFailure: {
+            _tag: "OAuthRenewalFailed",
+            account: session.account,
+            reason: "service_unavailable",
+          },
+          recovery: { action: unknownOutcomeAction },
+        });
+        const failed = yield* body(
+          Schema.Struct({
+            message: Schema.String,
+            recovery: Schema.Struct({ action: Schema.String, instructions: Schema.String }),
+          }),
+          written,
+        );
+        expect(failed.message).toBe(
+          `${name} records rejected the credentials for account “Synthetic records account” (HTTP 401) while calling a tool. Renewing the account’s access failed: Executor could not renew this account’s access. The sign-in endpoint may be unavailable or unreachable. The saved sign-in is kept; this error does not require reconnecting.`,
+        );
+        expectUnknownOutcome(failed.recovery);
+        expect(failed.recovery).toEqual(unknownOutcomeRecovery(renewalInsideWrite));
+        assertPrivate(written.body);
+        expect(yield* refreshes).toBe(beforeWrite + 1);
+        // The call was not repeated, and its change is still pending.
+        expect((yield* issuer.metrics).resourceRequests.POST).toBe(posts + 1);
+        expect(yield* saved(session.profile)).toEqual([]);
+        yield* records.commit;
+        expect(yield* saved(session.profile)).toEqual(["first"]);
+
+        // A read changed nothing, so the same failed renewal keeps its own retry advice.
+        const checked = yield* call(session.profile, "check", "query", {});
+        expect(checked.status, JSON.stringify(checked.body)).toBe(502);
+        expect(checked.body).toMatchObject({
+          _tag: "OAuthRenewalFailed",
+          account: session.account,
+          reason: "service_unavailable",
+          recovery: {
+            action: "Try again in a moment. If this continues, check the service’s status.",
+          },
+        });
+        expect(checked.body).not.toHaveProperty("mayHaveWritten");
+        assertPrivate(checked.body);
+
+        // A rate-limited renewal inside a write gets the same recovery: its wait is respected, and
+        // its advice to retry is not passed on.
+        yield* issuer.configure({ tokenError: refreshFailures.rate_limited });
+        const limited = yield* call(session.profile, "save", "mutation", { name: "second" });
+        expect(limited.status, JSON.stringify(limited.body)).toBe(502);
+        expect(limited.body).toMatchObject({
+          _tag: "AppProviderFailed",
+          mayHaveWritten: true,
+          renewalFailure: { _tag: "OAuthRenewalFailed", reason: "rate_limited" },
+          recovery: { action: unknownOutcomeAction },
+        });
+        const { recovery: limitedRecovery } = yield* body(
+          Schema.Struct({
+            recovery: Schema.Struct({ action: Schema.String, instructions: Schema.String }),
+          }),
+          limited,
+        );
+        expectUnknownOutcome(limitedRecovery);
+        expect(limitedRecovery).toEqual(unknownOutcomeRecovery(renewalInsideWrite));
+        assertPrivate(limited.body);
+        yield* issuer.configure({ tokenError: null, expiresIn: 20 });
+      }),
+    ),
+  );
+  it.effect(scenarios.oauthUnnamedKindRenewal.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { api, actors, issuer, prefix, name, connect, refreshes, assertPrivate } =
+          yield* renewalFixture;
+        const telemetry = yield* Telemetry;
+        const records = yield* recordingService;
+        for (const [mode, database] of [
+          ["worker", false],
+          ["facet", true],
+        ] as const) {
+          // The app's factory saves a record, then presents the account's token while the app is
+          // evaluated, before any tool runs. A call that names no kind evaluates it to find one.
+          const marker = `factory-${mode}`;
+          const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+            name: `${name} ${mode} factory`,
+            files: [
+              {
+                path: "index.ts",
+                content: `import { defineApp, defineProvider, oauth2, query, mutation, object, router, ProviderError } from "apps";
+const service = defineProvider({ name: ${JSON.stringify(`${name} ${mode} factory`)}, auth: { oauth: oauth2({ discover: ${JSON.stringify(`${issuer.origin}/mcp`)} }) } });
+export default defineApp({ accounts: { service } }, async ({ accounts, signal }) => {
+  await fetch(${JSON.stringify(`${records.url}/records`)}, { method: "POST", signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ name: ${JSON.stringify(marker)} }) });
+  const response = await fetch(${JSON.stringify(`${issuer.origin}/resource`)}, { signal, headers: { authorization: "Bearer " + accounts.service.fields.access_token } });
+  if (response.status === 401) throw new ProviderError({ reason: "unauthorized", status: 401, accountId: accounts.service.id });
+  const presented = await response.json();
+  return { tools: router({
+    save: mutation({ input: object({}) }, async () => ({ saved: true })),
+    check: query({ input: object({}) }, async () => presented),
+  }) };
+});`,
+              },
+              appsManifest,
+              ...databaseFiles(database),
+            ],
+          });
+          expect(deployed.status, JSON.stringify(deployed.body)).toBe(200);
+          const app = yield* body(AppProvider, deployed);
+          yield* Effect.addFinalizer(() =>
+            api.request(actors.owner, "DELETE", `${prefix}/apps/${app.id}`).pipe(Effect.orDie),
+          );
+          const call = (profile: string, tool: string, kind?: string) =>
+            api.request(actors.owner, "POST", `${prefix}/apps/${app.id}/tools/call`, {
+              profile,
+              tool,
+              ...(kind === undefined ? {} : { kind }),
+              input: {},
+            });
+          const factoryWrites = records.saved.pipe(
+            Effect.map((saved) => saved.filter((record) => record === marker).length),
+          );
+
+          // No `expires_in`, so only the service's refusal starts a renewal.
+          yield* issuer.configure({ expiresIn: null });
+          const session = yield* connect(`Synthetic ${mode} factory account`, app.id);
+          yield* issuer.expireAccessTokens;
+
+          // The renewal fails. The factory wrote once and the catalog is not evaluated again:
+          // the call's outcome is unknown, and the renewal's advice to try again is not passed on.
+          yield* issuer.configure({ tokenError: refreshFailures.unavailable });
+          const beforeFailure = { writes: yield* factoryWrites, refreshes: yield* refreshes };
+          const failed = yield* call(session.profile, "save");
+          expect(failed.status, JSON.stringify(failed.body)).toBe(502);
+          expect(failed.body, mode).toMatchObject({
+            _tag: "AppProviderFailed",
+            reason: "unauthorized",
+            status: 401,
+            account: { id: session.account },
+            mayHaveWritten: true,
+            renewalFailure: {
+              _tag: "OAuthRenewalFailed",
+              account: session.account,
+              reason: "service_unavailable",
+            },
+          });
+          const { recovery: failedRecovery } = yield* body(
+            Schema.Struct({
+              recovery: Schema.Struct({ action: Schema.String, instructions: Schema.String }),
+            }),
+            failed,
+          );
+          expectUnknownOutcome(failedRecovery);
+          expect(failedRecovery).toEqual(unknownOutcomeRecovery(renewalInsideWrite));
+          assertPrivate(failed.body);
+          expect(yield* factoryWrites, mode).toBe(beforeFailure.writes + 1);
+          expect(yield* refreshes).toBe(beforeFailure.refreshes + 1);
+
+          // The renewal succeeds. The catalog is still not evaluated again and the call is not
+          // made, so the factory wrote once; the response says the call was not repeated.
+          yield* issuer.configure({ tokenError: null });
+          const beforeRenewal = { writes: yield* factoryWrites, refreshes: yield* refreshes };
+          const renewed = yield* call(session.profile, "save");
+          expect(renewed.status, JSON.stringify(renewed.body)).toBe(502);
+          expect(renewed.body, mode).toMatchObject({
+            _tag: "AppProviderFailed",
+            reason: "unauthorized",
+            credentialsRenewed: true,
+            mayHaveWritten: true,
+          });
+          const renewedFailure = yield* body(
+            Schema.Struct({
+              message: Schema.String,
+              recovery: Schema.Struct({ action: Schema.String, instructions: Schema.String }),
+            }),
+            renewed,
+          );
+          expect(renewedFailure.message).toContain(
+            "Executor has renewed the account’s access, but did not repeat this call automatically.",
+          );
+          expectUnknownOutcome(renewedFailure.recovery);
+          assertPrivate(renewed.body);
+          expect(yield* factoryWrites, mode).toBe(beforeRenewal.writes + 1);
+          expect(yield* refreshes).toBe(beforeRenewal.refreshes + 1);
+          // The next call uses the renewed access.
+          const saved = yield* call(session.profile, "save");
+          expect(saved.status, JSON.stringify(saved.body)).toBe(200);
+          expect(yield* refreshes).toBe(beforeRenewal.refreshes + 1);
+
+          // A query keeps its renewal: the refused evaluation is repeated once with the renewed
+          // access. Its app code is taken to only read, so the factory runs twice.
+          yield* issuer.expireAccessTokens;
+          const beforeQuery = { writes: yield* factoryWrites, refreshes: yield* refreshes };
+          const checked = yield* call(session.profile, "check", "query");
+          expect(checked.status, JSON.stringify(checked.body)).toBe(200);
+          expect(checked.body, mode).toEqual(presented(beforeQuery.refreshes + 1));
+          expect(yield* refreshes).toBe(beforeQuery.refreshes + 1);
+          expect(yield* factoryWrites, mode).toBe(beforeQuery.writes + 2);
+          yield* issuer.configure({ tokenError: null, expiresIn: 20 });
+          // The calls ran where the case says: the facet loads its build in facet mode.
+          yield* telemetry
+            .spans("runtime.app.build.load", {
+              "executor.app.id": app.id,
+              "executor.runtime.mode": mode,
+            })
+            .pipe(
+              Effect.flatMap((spans) =>
+                spans.length > 0
+                  ? Effect.void
+                  : Effect.fail(new Error(`Missing ${mode} build load`)),
+              ),
+              Effect.retry({ schedule: Schedule.spaced("500 millis"), times: 80 }),
+            );
+        }
       }),
     ),
   );

@@ -1,6 +1,6 @@
 /** Explicit ephemeral adapters for isolated SDK fixtures. Hosts use durable Git and catalogs. */
 import { Effect } from "effect";
-import { SourceError, type RepositoryBackend } from "./contracts/source.ts";
+import { removedPaths, SourceError, type RepositoryBackend } from "./contracts/source.ts";
 import type { SourceFiles } from "./contracts/deployment.ts";
 import { RegistryError, type Registry } from "./contracts/registry.ts";
 
@@ -39,6 +39,8 @@ export const memoryRepositories = (): RepositoryBackend => {
         const branch = key(input.id, input.branch);
         if ((heads.get(branch) ?? null) !== input.expected)
           return yield* new SourceError({ reason: "conflict" });
+        const previous =
+          input.expected === null ? [] : (snapshots.get(`${input.id}/${input.expected}`) ?? []);
         const copy = structuredClone(input.files);
         const commit = yield* hash(copy);
         snapshots.set(`${input.id}/${commit}`, copy);
@@ -47,7 +49,13 @@ export const memoryRepositories = (): RepositoryBackend => {
           { commit, message: input.message, timestamp: Date.now() },
           ...(log.get(branch) ?? []),
         ]);
-        return commit;
+        return {
+          commit,
+          removed: removedPaths(
+            previous.map((file) => file.path),
+            input.files,
+          ),
+        };
       }),
     request: () => Effect.fail(new SourceError({ reason: "git" })),
   };

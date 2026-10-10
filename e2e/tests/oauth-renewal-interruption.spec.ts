@@ -15,7 +15,7 @@ import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { Resource } from "../support/contracts.ts";
-import { Evidence } from "../support/evidence.ts";
+import { Evidence, Telemetry } from "../support/evidence.ts";
 import { oauthSetupIssuer } from "../support/oauth-setup-issuer.ts";
 import { createProfile } from "../support/profiles.ts";
 import { serverControl } from "../support/server-control.ts";
@@ -327,6 +327,31 @@ const killedAndRestarted = (point: KillPoint, replacedRefreshTokens: "refused" |
           cause: { stage: "refresh", status: 400, providerError: "invalid_grant" },
         },
       ]);
+      // The caller that took over the dead process's claim records how long it went unconfirmed:
+      // longer than the lease, since the process never confirmed it again.
+      const evidence = yield* Evidence,
+        telemetry = yield* Telemetry;
+      const callTraces = (yield* evidence.requests).slice(-callers).map(({ traceId }) => traceId);
+      const takeovers = yield* Effect.forEach(callTraces, (traceId) =>
+        telemetry.query(traceId).pipe(
+          Effect.flatMap((result) =>
+            result.data.some(({ span }) => span.operationName === "oauth.resolve")
+              ? Effect.succeed(result)
+              : Effect.fail(new Error("Call trace has not arrived")),
+          ),
+          Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 40 }),
+          Effect.map((result) =>
+            result.data.flatMap(({ span }) => {
+              const age = span.tags["oauth.renewal.abandoned_claim_age_ms"];
+              return span.operationName === "oauth.resolve" && age !== undefined
+                ? [Number(age)]
+                : [];
+            }),
+          ),
+        ),
+      ).pipe(Effect.map((ages) => ages.flat()));
+      expect(takeovers.length, point).toBe(1);
+      expect(takeovers[0], point).toBeGreaterThan(20_000);
       // Later calls are refused without presenting the refused token again.
       const again = yield* read;
       expect(again.status, JSON.stringify(again.body)).toBe(409);

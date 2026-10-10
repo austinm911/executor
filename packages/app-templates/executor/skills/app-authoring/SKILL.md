@@ -38,6 +38,10 @@ build through `execute`; source then travels as data inside tool calls.
 For a new UI with storage, start with `starter.md`. It links to the topics
 needed to adapt the example. For an existing app, read its current source and
 the reference for the part being changed.
+
+Tools generated from an MCP server, OpenAPI definition or GraphQL schema are a
+starting point. When one is missing or wrong, write your own tool for it in the
+same app with the same account ([integrations.md](integrations.md#custom-tools-beside-generated-ones)).
 Load files through the MCP `skills` tool using the returned app slug, profile,
 deployment and content revision, for example
 `{ app: "executor", name: "app-authoring", file: "ui.md", deployment, profile, revision }`.

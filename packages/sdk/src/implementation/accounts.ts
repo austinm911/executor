@@ -2,7 +2,12 @@ import { AccountWorkflowsActive } from "../contracts/account.ts";
 import { AccountWebhooksActive } from "../contracts/account.ts";
 /** Reusable account operations. Owners remain lookup predicates, not authorization. */
 import { Clock, type Crypto, Effect, Redacted, Schema } from "effect";
-import { Account, AccountNotFound, type AccountSignIn } from "../contracts/account.ts";
+import {
+  Account,
+  AccountNotFound,
+  type AccountSignIn,
+  type ManagedAccountInputs,
+} from "../contracts/account.ts";
 import { OAuthGrant } from "../contracts/oauth.ts";
 import type { Executor, ResourceLifecycle } from "../contracts/executor.ts";
 import { Provider, ProviderNotFound } from "../contracts/provider.ts";
@@ -141,7 +146,7 @@ export const makeAccounts = (
   /** Best-effort provider-side revocation; it never fails and runs only after the delete commits. */
   revokeRemoved?: (removed: RemovedGrant) => Effect.Effect<void>,
 ) => ({
-  add: (input: Parameters<Executor["accounts"]["add"]>[0]) =>
+  add: (input: typeof ManagedAccountInputs.add.Type) =>
     Effect.gen(function* () {
       const row = yield* query(() =>
         db.findFirst("providers", { where: (b) => b("id", "=", input.provider) }),
@@ -214,7 +219,7 @@ export const makeAccounts = (
         );
       }),
     ).pipe(Effect.withSpan("sdk.accounts.update")),
-  replaceCredentials: (input: Parameters<Executor["accounts"]["replaceCredentials"]>[0]) =>
+  replaceCredentials: (input: typeof ManagedAccountInputs.replaceCredentials.Type) =>
     transaction(db, (tx) =>
       Effect.gen(function* () {
         const account = yield* ownedAccount(tx, input);

@@ -64,7 +64,7 @@ export const AccountConnection = Schema.Struct({
   owner: OwnerId,
   provider: Provider,
   reconnectAccount: Schema.NullOr(Account),
-  target: Schema.NullOr(AccountConnectionDestination),
+  target: AccountConnectionDestination,
   createdAt: Schema.Date,
   expiresAt: Schema.Date,
   state: AccountConnectionState,

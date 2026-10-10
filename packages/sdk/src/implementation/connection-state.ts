@@ -44,9 +44,9 @@ export const readConnection = (db: Query, input: typeof GetAccountConnection.Typ
     const stored = yield* Schema.decodeUnknownEffect(StoredState)(row.state).pipe(
       Effect.mapError(() => new StorageError()),
     );
-    const target = yield* Schema.decodeUnknownEffect(Schema.NullOr(StoredConnectionTarget))(
-      row.target,
-    ).pipe(Effect.mapError(() => new StorageError()));
+    const target = yield* Schema.decodeUnknownEffect(StoredConnectionTarget)(row.target).pipe(
+      Effect.mapError(() => new StorageError()),
+    );
     const now = yield* Clock.currentTimeMillis;
     // An expired request keeps the failure that ended its latest sign-in.
     const state: AccountConnectionState =
@@ -96,8 +96,7 @@ export const openConnection = (db: Query, input: typeof GetAccountConnection.Typ
  */
 export const finishConnection = (db: Query, claimed: ConnectionRow, account: Account) =>
   Effect.gen(function* () {
-    if (claimed.target !== null)
-      yield* applyConnectionTarget(db, claimed.target, claimed.provider, account);
+    yield* applyConnectionTarget(db, claimed.target, claimed.provider, account);
     yield* query(() =>
       db.updateMany("accountConnections", {
         where: (b) => b("id", "=", claimed.id),

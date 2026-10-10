@@ -1,5 +1,6 @@
 import { ProviderError } from "apps/contracts";
 import { appProviderFailure } from "./provider-error.ts";
+import { AppProviderFailed, mayHaveWritten } from "../contracts/tools.ts";
 import type { ResourceLifecycle } from "../contracts/executor.ts";
 import type { WorkflowHostControls } from "apps/contracts";
 import { CompleteWebhookSetup, WebhookSetupView } from "../contracts/webhook-setup.ts";
@@ -105,7 +106,8 @@ export const makeWebhooks = (
         .pipe(
           Effect.mapError((error) =>
             Schema.is(ProviderError)(error)
-              ? appProviderFailure(state, error)
+              ? // Registering, completing, removing and handling a webhook may change the service.
+                mayHaveWritten(AppProviderFailed, appProviderFailure(state, error))
               : new WebhookFailed({
                   reason: command.operation === "webhook-handle" ? "delivery" : "definition",
                 }),

@@ -1,9 +1,6 @@
 /** Local launcher behavior. Runtime process APIs are supplied only at entry points. */
 import { Console, Effect, Redacted } from "effect";
-import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
-import { HttpApiClient } from "effect/http-api";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
-import { LocalAuthApi } from "../contracts/auth.ts";
 import { localConfiguration } from "./bootstrap.ts";
 import { StartupFailed, type LaunchMode } from "../contracts/startup.ts";
 import { readDesktopBootstrap, startLocalServer } from "../node.ts";
@@ -23,23 +20,12 @@ const openBrowser = (url: Redacted.Redacted<string>, platform: string) =>
   }).pipe(Effect.mapError(() => new StartupFailed({ stage: "browser" })));
 
 /**
- * Start headless/browser/desktop using one server; pairing an existing server never opens storage.
+ * Start headless/browser/desktop using one server. Pairing with a running server is `pair.ts`.
  * `installation` is the running CLI's own file, which tells the update notice how it was installed.
  */
 export const launch = (mode: LaunchMode, platform: string, installation?: string) =>
   Effect.gen(function* () {
     const settings = yield* localConfiguration(platform);
-    if (mode === "pair") {
-      const client = yield* HttpApiClient.make(LocalAuthApi, {
-        baseUrl: `http://127.0.0.1:${settings.port}`,
-        transformClient: (client) =>
-          client.pipe(HttpClient.mapRequest(HttpClientRequest.bearerToken(settings.apiKey))),
-      }).pipe(Effect.provide(FetchHttpClient.layer));
-      const link = yield* client.auth
-        .pair()
-        .pipe(Effect.mapError(() => new StartupFailed({ stage: "pair" })));
-      return yield* Console.log(Redacted.value(link.url));
-    }
     const bootstrap = mode === "desktop" ? yield* readDesktopBootstrap : undefined;
     const server = yield* startLocalServer(settings, bootstrap, {
       product: mode === "desktop" ? "desktop" : "cli",

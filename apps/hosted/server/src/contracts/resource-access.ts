@@ -80,13 +80,11 @@ export const ConnectionAccess = Schema.Struct({
   connection: AccountConnectionId,
   creator: Principal.fields.userId,
   destination: ConnectionDestination,
-  target: Schema.NullOr(
-    Schema.Struct({
-      app: AppId,
-      requirement: Schema.NonEmptyString,
-      profile: ProfileId,
-    }).pipe(Schema.encodeKeys({ profile: "installation" })),
-  ),
+  target: Schema.Struct({
+    app: AppId,
+    requirement: Schema.NonEmptyString,
+    profile: ProfileId,
+  }).pipe(Schema.encodeKeys({ profile: "installation" })),
 });
 const accessConflicts = {
   changed: "Sharing changed since it was read. Read it again and reapply the edit.",
