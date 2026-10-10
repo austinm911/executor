@@ -80,6 +80,7 @@ export const makeDeclarationCache = (
       for (const [key, entry] of entries) if (entry.app === app && entry.at <= at) remove(key);
     },
     outdated: (app, at) => at <= (changes.get(app) ?? -Infinity),
+    usage: () => ({ entries: entries.size, bytes }),
   };
 };
 

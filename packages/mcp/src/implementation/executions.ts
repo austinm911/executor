@@ -144,6 +144,14 @@ type Run = {
   closed: boolean;
 };
 
+/**
+ * Programs running in this process, across every execution store in it. On Cloud the process is
+ * an isolate that several MCP session objects share, and every program there counts against its
+ * one memory limit, parked ones included.
+ */
+const live = { programs: 0 };
+export const runningPrograms = () => live.programs;
+
 /** Both transports drive this bounded, host-owned store. Closing it cancels programs and their tools. */
 export const makeExecutions = (
   limits: McpLimits,
@@ -692,16 +700,27 @@ export const makeExecutions = (
           }
           runs.add(run);
           yield* Effect.annotateCurrentSpan("executor.execution.id", run.id);
+          // Ends at once, so it is exported even when the process dies while the program runs.
+          yield* Effect.withSpan(Effect.void, "mcp.execution.started", {
+            attributes: {
+              "executor.execution.id": run.id,
+              "executor.execution.concurrent": live.programs,
+            },
+          });
           yield* beforeExecute.pipe(
             Effect.onError(() => stop(run)),
             Effect.onInterrupt(() => stop(run)),
           );
-          const program = executeProgram(
-            broker(run),
-            limits,
-            code,
-            Deferred.await(run.expired),
-            run.progress,
+          const program = Effect.acquireUseRelease(
+            Effect.sync(() => {
+              live.programs += 1;
+            }),
+            () =>
+              executeProgram(broker(run), limits, code, Deferred.await(run.expired), run.progress),
+            () =>
+              Effect.sync(() => {
+                live.programs -= 1;
+              }),
           ).pipe(
             Effect.onExit((exit) =>
               Queue.offer(run.events, {

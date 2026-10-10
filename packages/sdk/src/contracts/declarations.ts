@@ -159,6 +159,8 @@ export interface DeclarationCache {
   readonly changed: (app: string, at: number) => void;
   /** Whether a result of the app evaluated from `at` predates an invalidation seen here. */
   readonly outdated: (app: string, at: number) => boolean;
+  /** What the store holds now, measured as its limits are. */
+  readonly usage: () => { readonly entries: number; readonly bytes: number };
 }
 
 /**

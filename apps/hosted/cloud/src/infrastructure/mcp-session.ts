@@ -8,6 +8,7 @@ import {
   dispatchHostedMcp,
   makeHostedMcp,
 } from "@executor-js/hosted-server";
+import { runningPrograms } from "@executor-js/mcp";
 import * as Cloudflare from "alchemy/Cloudflare";
 import { Effect, type Layer, type Scope } from "effect";
 import { HttpServer, HttpServerRequest, type HttpServerResponse } from "effect/http";
@@ -16,6 +17,7 @@ import { makeAnswer } from "../implementation/mcp-session-timing.ts";
 import { observeMcpStream } from "../implementation/mcp-stream-observability.ts";
 import { cloudAnalytics } from "../implementation/product-analytics.ts";
 import type { cloudServingProduct } from "./serving-product.ts";
+import { isolateDeclarations } from "./isolate-memory.ts";
 import { cloudObjectDatabase, ObjectDatabase } from "./object-database.ts";
 
 /**
@@ -38,7 +40,14 @@ export const makeMcpSession = Effect.fn(function* ({ executor, identity }: McpSe
     // Opaque object identity is stable across activations; the random activation
     // identifies a fresh in-memory MCP registry without recording session tokens.
     const activation = yield* Effect.sync(() => crypto.randomUUID());
-    const answer = makeAnswer();
+    const answer = makeAnswer(() => {
+      const kept = isolateDeclarations.usage();
+      return {
+        "executor.mcp.isolate.programs": runningPrograms(),
+        "executor.mcp.isolate.kept_entries": kept.entries,
+        "executor.mcp.isolate.kept_bytes": kept.bytes,
+      };
+    });
     const handler = yield* makeHostedMcp().pipe(Effect.provide(HttpServer.layerServices));
     const browser = browserMcpRequest((access, address) =>
       hostedMcpApproval(handler.approvals, access, address).pipe(
